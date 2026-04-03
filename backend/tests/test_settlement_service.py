@@ -473,19 +473,29 @@ class TestSettleOpenTrades:
         assert count == 0
         mock_client.get_order.assert_not_awaited()
 
-    def test_partial_status_trade_is_skipped(self, db):
-        """Trade with status='partial' is excluded from the settlement query."""
+    def test_partial_status_trade_is_settled_when_market_resolves(self, db):
+        """Trade with status='partial' is eligible for settlement once close_price appears."""
         from app.services import settlement_service
 
-        _make_trade(db, contracts=5, price=0.50, status="partial")
+        trade = _make_trade(db, contracts=5, price=0.50, side="yes", status="partial")
 
         mock_client = MagicMock()
-        mock_client.get_order = AsyncMock()
+        mock_client.get_order = AsyncMock(
+            return_value={
+                "status": "filled",
+                "close_price": 100,
+                "yes_price": 50,
+                "filled_count": 5,
+            }
+        )
 
         with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
             count = _run(settlement_service.settle_open_trades(db))
 
-        assert count == 0
+        assert count == 1
+        db.refresh(trade)
+        assert trade.status == "settled"
+        assert trade.pnl == pytest.approx((100 - 50) * 5 / 100)  # 2.5
 
     def test_bulk_settles_mixed_simulated_and_real_trades(self, db):
         """Simulated trades routed to _settle_simulated; real trades to _settle_real."""

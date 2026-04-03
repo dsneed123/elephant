@@ -35,7 +35,7 @@ async def settle_open_trades(db: Session) -> int:
         .filter(
             CopiedTrade.pnl.is_(None),
             CopiedTrade.kalshi_order_id.isnot(None),
-            CopiedTrade.status.notin_(["settled", "cancelled", "partial"]),
+            CopiedTrade.status.notin_(["settled", "cancelled"]),
         )
         .all()
     )
