@@ -35,7 +35,7 @@ async def settle_open_trades(db: Session) -> int:
         .filter(
             CopiedTrade.pnl.is_(None),
             CopiedTrade.kalshi_order_id.isnot(None),
-            CopiedTrade.status.notin_(["settled", "cancelled"]),
+            CopiedTrade.status.notin_(["settled", "cancelled", "partial"]),
         )
         .all()
     )
@@ -139,7 +139,21 @@ async def _settle_real(db: Session, trade: CopiedTrade, client) -> int:
     if fill_price_cents is None:
         fill_price_cents = trade.price * 100  # trade.price is in dollars
 
-    filled_count = order.get("filled_count") or trade.contracts
+    raw_filled = order.get("filled_count")
+    if raw_filled is not None and raw_filled == 0:
+        # Zero fills: treat as cancelled.
+        trade.status = "cancelled"
+        db.commit()
+        logger.info(
+            "Trade %d cancelled (zero fills, order %s)", trade.id, trade.kalshi_order_id
+        )
+        return 0
+
+    originally_requested = trade.contracts
+    filled_count = raw_filled if raw_filled is not None else trade.contracts
+
+    # Always update trade.contracts to the actual filled amount.
+    trade.contracts = filled_count
 
     if trade.side == "yes":
         pnl = (close_price - fill_price_cents) * filled_count / 100
@@ -147,17 +161,20 @@ async def _settle_real(db: Session, trade: CopiedTrade, client) -> int:
         pnl = ((100 - close_price) - fill_price_cents) * filled_count / 100
 
     trade.pnl = pnl
-    trade.status = "settled"
+    trade.status = "partial" if filled_count < originally_requested else "settled"
     trade.settled_at = datetime.utcnow()
     db.commit()
 
     logger.info(
-        "Settled trade %d: %s %s close_price=%d fill=%d¢ pnl=%.4f",
+        "Settled trade %d (%s): %s %s close_price=%d fill=%d¢ filled=%d/%d pnl=%.4f",
         trade.id,
+        trade.status,
         trade.market_ticker,
         trade.side,
         close_price,
         fill_price_cents,
+        filled_count,
+        originally_requested,
         pnl,
     )
     return 1
