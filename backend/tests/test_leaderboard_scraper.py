@@ -1,10 +1,8 @@
-"""Tests for LeaderboardScraper scoring, normalization, and market enrichment."""
+"""Tests for LeaderboardScraper: scoring, merging, persistence, and pipeline."""
 
 import asyncio
-import json
 import math
-from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -48,254 +46,303 @@ def _make_http_response(status_code: int, json_body: dict) -> MagicMock:
     return resp
 
 
+# ---------------------------------------------------------------------------
+# _compute_elephant_score
+# ---------------------------------------------------------------------------
+
 class TestComputeElephantScore:
-    def _data(self, **kwargs):
-        base = {
-            "win_rate": 0.0,
-            "total_profit": 0.0,
-            "consistency_score": 0.0,
-            "market_diversity": 0,
-        }
-        base.update(kwargs)
-        return base
-
-    def test_zero_data_returns_ten(self, scraper):
-        # All zeros except recency (no last_active → defaults to 1.0)
-        # raw = 0.10 * 1.0 = 0.10 → 10.0
-        score = scraper._compute_elephant_score(self._data())
-        assert score == pytest.approx(10.0, abs=0.01)
-
-    def test_weights_sum_correctly(self, scraper):
-        # Perfect trader, active now → score should be 100
-        data = self._data(
-            win_rate=1.0,
-            total_profit=10_000.0,
-            consistency_score=1.0,
-            market_diversity=20,
-        )
+    def test_rank1_all_metrics_returns_100(self, scraper):
+        data = {"rank_pnl": 1, "rank_volume": 1, "rank_markets": 1, "markets_traded": 100}
         score = scraper._compute_elephant_score(data)
-        assert score == pytest.approx(100.0, abs=0.01)
+        assert score == pytest.approx(100.0, abs=0.1)
 
-    def test_recency_within_7_days(self, scraper):
-        last_active = datetime.now(timezone.utc) - timedelta(days=3)
-        data = self._data(win_rate=1.0, consistency_score=1.0, market_diversity=20,
-                          total_profit=10_000.0, last_active=last_active)
-        score = scraper._compute_elephant_score(data)
-        assert score == pytest.approx(100.0, abs=0.01)
-
-    def test_recency_exactly_7_days(self, scraper):
-        last_active = datetime.now(timezone.utc) - timedelta(days=7)
-        data = self._data(last_active=last_active)
-        score_7 = scraper._compute_elephant_score(data)
-        score_no_date = scraper._compute_elephant_score(self._data())
-        # Both should have recency=1.0
-        assert score_7 == pytest.approx(score_no_date, abs=0.1)
-
-    def test_recency_at_90_days_is_zero(self, scraper):
-        last_active = datetime.now(timezone.utc) - timedelta(days=90)
-        data = self._data(last_active=last_active)
-        # recency=0, all other zeros → raw=0 → score=0
-        score = scraper._compute_elephant_score(data)
+    def test_no_rank_data_returns_zero(self, scraper):
+        # rank defaults to 999 → pnl_score=0, vol_score=0; markets=0; cross=0
+        score = scraper._compute_elephant_score({})
         assert score == pytest.approx(0.0, abs=0.01)
 
-    def test_recency_beyond_90_days_clamped(self, scraper):
-        last_active = datetime.now(timezone.utc) - timedelta(days=200)
-        data = self._data(last_active=last_active)
+    def test_pnl_rank1_contributes_correctly(self, scraper):
+        # rank_pnl=1 → pnl_score=1.0, cross_score=1/3
+        data = {"rank_pnl": 1}
         score = scraper._compute_elephant_score(data)
-        assert score == pytest.approx(0.0, abs=0.01)
+        expected = round((0.40 * 1.0 + 0.15 * (1 / 3)) * 100.0, 2)
+        assert score == pytest.approx(expected, abs=0.01)
 
-    def test_recency_midpoint_linear(self, scraper):
-        # At day 48.5 (midpoint of 7–90), recency ≈ 0.5
-        days_mid = 7 + (90 - 7) / 2  # = 48.5
-        last_active = datetime.now(timezone.utc) - timedelta(days=days_mid)
-        data = self._data(last_active=last_active)
+    def test_rank_201_gives_zero_pnl_score(self, scraper):
+        # pnl_score = max(0, 1 - 200/200) = 0; cross_score = 1/3
+        data = {"rank_pnl": 201}
         score = scraper._compute_elephant_score(data)
-        # Only recency contributes (others = 0), weight 10%
-        expected = round(0.10 * 0.5 * 100.0, 2)
-        assert score == pytest.approx(expected, abs=0.2)
+        expected = round(0.15 * (1 / 3) * 100.0, 2)
+        assert score == pytest.approx(expected, abs=0.01)
 
-    def test_win_rate_weight_30pct(self, scraper):
-        # win_rate=1, all else zero, no last_active (recency=1.0 → 10%)
-        data = self._data(win_rate=1.0)
+    def test_diversity_log_scaled(self, scraper):
+        # markets_traded=100 → diversity_score=1.0; no rank keys
+        data = {"markets_traded": 100}
         score = scraper._compute_elephant_score(data)
-        # 0.30*1 + 0.10*1 = 0.40 → 40.0
-        assert score == pytest.approx(40.0, abs=0.01)
+        expected = round(0.20 * 1.0 * 100.0, 2)
+        assert score == pytest.approx(expected, abs=0.01)
 
-    def test_consistency_weight_25pct(self, scraper):
-        data = self._data(consistency_score=1.0)
+    def test_cross_metric_bonus_all_three_present(self, scraper):
+        # rank keys present but beyond 200; only cross contributes
+        data = {"rank_pnl": 999, "rank_volume": 999, "rank_markets": 999}
         score = scraper._compute_elephant_score(data)
-        # 0.25 + 0.10 = 0.35 → 35.0
-        assert score == pytest.approx(35.0, abs=0.01)
+        expected = round(0.15 * 1.0 * 100.0, 2)
+        assert score == pytest.approx(expected, abs=0.01)
 
-    def test_diversity_weight_15pct(self, scraper):
-        data = self._data(market_diversity=20)
+    def test_cross_metric_bonus_one_metric(self, scraper):
+        data = {"rank_pnl": 999}
         score = scraper._compute_elephant_score(data)
-        # 0.15 + 0.10 = 0.25 → 25.0
-        assert score == pytest.approx(25.0, abs=0.01)
-
-    def test_profit_log_scaling(self, scraper):
-        # At $10k profit, profit_score should be 1.0
-        data = self._data(total_profit=10_000.0)
-        score = scraper._compute_elephant_score(data)
-        # 0.20*1.0 + 0.10*1.0 = 0.30 → 30.0
-        assert score == pytest.approx(30.0, abs=0.01)
-
-    def test_negative_profit_ignored(self, scraper):
-        data = self._data(total_profit=-500.0)
-        score = scraper._compute_elephant_score(data)
-        assert score == pytest.approx(10.0, abs=0.01)  # only recency
-
-    def test_win_rate_clamped_above_1(self, scraper):
-        data = self._data(win_rate=1.5)
-        score_clamped = scraper._compute_elephant_score(data)
-        data_normal = self._data(win_rate=1.0)
-        score_normal = scraper._compute_elephant_score(data_normal)
-        assert score_clamped == score_normal
+        expected = round(0.15 * (1 / 3) * 100.0, 2)
+        assert score == pytest.approx(expected, abs=0.01)
 
 
 # ---------------------------------------------------------------------------
-# _normalize_entry — top_markets extraction
+# _assign_tier
 # ---------------------------------------------------------------------------
 
-class TestNormalizeEntryTopMarkets:
-    def test_extracts_top_markets_list(self, scraper):
-        entry = {"username": "alice", "top_markets": ["MARKET-A", "MARKET-B"]}
-        result = scraper._normalize_entry(entry, 0)
-        assert result["top_markets"] == ["MARKET-A", "MARKET-B"]
-
-    def test_extracts_topMarkets_camelcase(self, scraper):
-        entry = {"username": "alice", "topMarkets": ["MARKET-X"]}
-        result = scraper._normalize_entry(entry, 0)
-        assert result["top_markets"] == ["MARKET-X"]
-
-    def test_no_market_data_gives_empty_list(self, scraper):
-        entry = {"username": "alice"}
-        result = scraper._normalize_entry(entry, 0)
-        assert result["top_markets"] == []
-
-    def test_non_list_market_data_gives_empty_list(self, scraper):
-        entry = {"username": "alice", "top_markets": "MARKET-A"}
-        result = scraper._normalize_entry(entry, 0)
-        assert result["top_markets"] == []
+class TestAssignTier:
+    @pytest.mark.parametrize("rank,expected", [
+        (1, "top_001"),
+        (10, "top_001"),
+        (11, "top_01"),
+        (25, "top_01"),
+        (26, "top_1"),
+        (50, "top_1"),
+        (51, "top_25"),
+        (100, "top_25"),
+        (101, "ranked"),
+        (500, "ranked"),
+    ])
+    def test_tier_assignment(self, scraper, rank, expected):
+        assert scraper._assign_tier(rank) == expected
 
 
 # ---------------------------------------------------------------------------
-# _upsert_trader — top_markets persistence
+# _fetch_metric — Kalshi leaderboard API
 # ---------------------------------------------------------------------------
 
-class TestUpsertTraderTopMarkets:
-    def _base_data(self, **kwargs):
-        data = {
-            "username": "whale_trader",
-            "display_name": "Whale Trader",
-            "total_profit": 5000.0,
-            "win_rate": 0.75,
-            "total_trades": 50,
-            "avg_position_size": 100.0,
-            "market_diversity": 10,
-            "consistency_score": 0.8,
-            "top_markets": [],
-        }
-        data.update(kwargs)
-        return data
-
-    def test_new_trader_stores_top_markets(self, scraper, db):
-        data = self._base_data(top_markets=["NASDAQ-24DEC31", "FED-24DEC18"])
-        trader = scraper._upsert_trader(db, data, rank=1, total=10)
-        db.flush()
-        assert trader.top_markets == json.dumps(["NASDAQ-24DEC31", "FED-24DEC18"])
-
-    def test_new_trader_with_empty_markets_stores_null(self, scraper, db):
-        data = self._base_data(top_markets=[])
-        trader = scraper._upsert_trader(db, data, rank=1, total=10)
-        db.flush()
-        assert trader.top_markets is None
-
-    def test_existing_trader_markets_updated_when_new_data(self, scraper, db):
-        # Insert trader with initial markets
-        data = self._base_data(top_markets=["MARKET-A"])
-        scraper._upsert_trader(db, data, rank=1, total=10)
-        db.commit()
-
-        # Update with new markets
-        data["top_markets"] = ["MARKET-A", "MARKET-B"]
-        trader = scraper._upsert_trader(db, data, rank=1, total=10)
-        db.commit()
-        assert json.loads(trader.top_markets) == ["MARKET-A", "MARKET-B"]
-
-    def test_existing_trader_markets_preserved_when_no_new_data(self, scraper, db):
-        # Insert trader with markets
-        data = self._base_data(top_markets=["MARKET-A"])
-        scraper._upsert_trader(db, data, rank=1, total=10)
-        db.commit()
-
-        # Update with empty markets — existing data should be preserved
-        data["top_markets"] = []
-        trader = scraper._upsert_trader(db, data, rank=1, total=10)
-        db.commit()
-        assert json.loads(trader.top_markets) == ["MARKET-A"]
-
-
-# ---------------------------------------------------------------------------
-# _fetch_trader_markets — Kalshi public API
-# ---------------------------------------------------------------------------
-
-class TestFetchTraderMarkets:
+class TestFetchMetric:
     def _run(self, coro):
         return asyncio.run(coro)
 
-    def test_returns_sorted_tickers_from_trades(self, scraper):
+    def test_returns_rank_list_on_success(self, scraper):
         resp = _make_http_response(200, {
-            "trades": [
-                {"ticker": "NASDAQ-24DEC31"},
-                {"ticker": "FED-24DEC18"},
-                {"ticker": "NASDAQ-24DEC31"},  # duplicate — should be deduplicated
+            "rank_list": [
+                {"nickname": "trader1", "rank": 1, "value": 5000.0, "is_anonymous": False},
+                {"nickname": "trader2", "rank": 2, "value": 3000.0, "is_anonymous": False},
             ]
         })
         client = AsyncMock()
         client.get = AsyncMock(return_value=resp)
-        result = self._run(scraper._fetch_trader_markets(client, "alice"))
-        assert result == ["FED-24DEC18", "NASDAQ-24DEC31"]
+        result = self._run(scraper._fetch_metric(client, "projected_pnl", "weekly", 50))
+        assert len(result) == 2
+        assert result[0]["nickname"] == "trader1"
 
-    def test_returns_empty_on_401(self, scraper):
-        resp = _make_http_response(401, {})
+    def test_returns_empty_list_on_success_with_no_data(self, scraper):
+        resp = _make_http_response(200, {"rank_list": []})
         client = AsyncMock()
         client.get = AsyncMock(return_value=resp)
-        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        result = self._run(scraper._fetch_metric(client, "projected_pnl", "weekly", 50))
         assert result == []
 
-    def test_returns_empty_on_403(self, scraper):
-        resp = _make_http_response(403, {})
+    def test_returns_empty_on_http_error(self, scraper):
+        resp = _make_http_response(500, {})
         client = AsyncMock()
         client.get = AsyncMock(return_value=resp)
-        result = self._run(scraper._fetch_trader_markets(client, "alice"))
-        assert result == []
-
-    def test_returns_empty_on_404(self, scraper):
-        resp = _make_http_response(404, {})
-        client = AsyncMock()
-        client.get = AsyncMock(return_value=resp)
-        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        result = self._run(scraper._fetch_metric(client, "projected_pnl", "weekly", 50))
         assert result == []
 
     def test_returns_empty_on_network_error(self, scraper):
         client = AsyncMock()
-        client.get = AsyncMock(side_effect=httpx.RequestError("timeout"))
-        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        client.get = AsyncMock(side_effect=httpx.RequestError("connection refused"))
+        result = self._run(scraper._fetch_metric(client, "projected_pnl", "weekly", 50))
         assert result == []
 
-    def test_handles_market_ticker_field_name(self, scraper):
-        resp = _make_http_response(200, {
-            "trades": [{"market_ticker": "BTCUSDT-24DEC31"}]
+    @pytest.mark.parametrize("status_code", [401, 403, 404])
+    def test_returns_empty_on_4xx_error(self, scraper, status_code):
+        resp = _make_http_response(status_code, {})
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+        result = self._run(scraper._fetch_metric(client, "projected_pnl", "weekly", 50))
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# fetch_all_metrics — merging logic
+# ---------------------------------------------------------------------------
+
+class TestFetchAllMetrics:
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _mock_client(self, responses: dict) -> MagicMock:
+        """Build a mock AsyncClient that dispatches by metric_name param."""
+        async def fake_get(url, params=None):
+            metric = (params or {}).get("metric_name", "")
+            entries = responses.get(metric, [])
+            return _make_http_response(200, {"rank_list": entries})
+
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=fake_get)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        return client
+
+    def test_merges_pnl_and_volume_for_same_trader(self, scraper):
+        mock = self._mock_client({
+            "projected_pnl": [
+                {"nickname": "alice", "rank": 1, "value": 5000.0, "is_anonymous": False}
+            ],
+            "volume": [
+                {"nickname": "alice", "rank": 2, "value": 10000.0, "is_anonymous": False}
+            ],
         })
-        client = AsyncMock()
-        client.get = AsyncMock(return_value=resp)
-        result = self._run(scraper._fetch_trader_markets(client, "alice"))
-        assert result == ["BTCUSDT-24DEC31"]
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient", return_value=mock), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = self._run(scraper.fetch_all_metrics())
 
-    def test_empty_trades_list_returns_empty(self, scraper):
-        resp = _make_http_response(200, {"trades": []})
-        client = AsyncMock()
-        client.get = AsyncMock(return_value=resp)
-        result = self._run(scraper._fetch_trader_markets(client, "alice"))
-        assert result == []
+        assert "alice" in result
+        assert result["alice"]["rank_pnl"] == 1
+        assert result["alice"]["rank_volume"] == 2
+
+    def test_skips_anonymous_entries(self, scraper):
+        mock = self._mock_client({
+            "projected_pnl": [
+                {"nickname": "anon", "rank": 1, "value": 9999.0, "is_anonymous": True}
+            ],
+        })
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient", return_value=mock), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = self._run(scraper.fetch_all_metrics())
+
+        assert result == {}
+
+    def test_skips_empty_nickname(self, scraper):
+        mock = self._mock_client({
+            "projected_pnl": [
+                {"nickname": "", "rank": 1, "value": 9999.0, "is_anonymous": False}
+            ],
+        })
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient", return_value=mock), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = self._run(scraper.fetch_all_metrics())
+
+        assert result == {}
+
+    def test_multiple_traders_across_metrics(self, scraper):
+        mock = self._mock_client({
+            "projected_pnl": [
+                {"nickname": "alice", "rank": 1, "value": 5000.0, "is_anonymous": False},
+                {"nickname": "bob", "rank": 2, "value": 3000.0, "is_anonymous": False},
+            ],
+            "num_markets_traded": [
+                {"nickname": "bob", "rank": 1, "value": 20, "is_anonymous": False},
+            ],
+        })
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient", return_value=mock), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = self._run(scraper.fetch_all_metrics())
+
+        assert "alice" in result
+        assert "bob" in result
+        assert result["bob"]["rank_markets"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _upsert_trader — persistence
+# ---------------------------------------------------------------------------
+
+class TestUpsertTrader:
+    def _base_data(self, **kwargs):
+        data = {
+            "nickname": "WhaleTrader",
+            "pnl": 5000.0,
+            "volume": 50000.0,
+            "markets_traded": 15,
+            "rank_pnl": 5,
+            "rank_volume": 8,
+            "rank_markets": 3,
+        }
+        data.update(kwargs)
+        return data
+
+    def test_new_trader_inserted_with_correct_username(self, scraper, db):
+        data = self._base_data()
+        trader = scraper._upsert_trader(db, data)
+        db.flush()
+        assert trader.kalshi_username == "whaletrader"
+        assert trader.display_name == "WhaleTrader"
+
+    def test_new_trader_has_positive_elephant_score(self, scraper, db):
+        data = self._base_data()
+        trader = scraper._upsert_trader(db, data)
+        db.flush()
+        assert trader.elephant_score is not None
+        assert trader.elephant_score > 0
+
+    def test_new_trader_win_rate_is_not_none(self, scraper, db):
+        data = self._base_data()
+        trader = scraper._upsert_trader(db, data)
+        db.flush()
+        assert trader.win_rate is not None
+
+    def test_new_trader_is_active(self, scraper, db):
+        data = self._base_data()
+        trader = scraper._upsert_trader(db, data)
+        db.flush()
+        assert trader.is_active is True
+
+    def test_existing_trader_profit_updated(self, scraper, db):
+        data = self._base_data()
+        scraper._upsert_trader(db, data)
+        db.commit()
+
+        data["pnl"] = 9000.0
+        trader = scraper._upsert_trader(db, data)
+        db.commit()
+        assert trader.total_profit == 9000.0
+
+    def test_existing_trader_elephant_score_recalculated(self, scraper, db):
+        data = self._base_data(rank_pnl=50)
+        scraper._upsert_trader(db, data)
+        db.commit()
+        old_score = db.query(TrackedTrader).first().elephant_score
+
+        data["rank_pnl"] = 1
+        scraper._upsert_trader(db, data)
+        db.commit()
+        new_score = db.query(TrackedTrader).first().elephant_score
+
+        assert new_score > old_score
+
+
+# ---------------------------------------------------------------------------
+# End-to-end pipeline: the required test
+# ---------------------------------------------------------------------------
+
+class TestScrapePipelineEndToEnd:
+    def test_scrape_produces_trader_with_non_null_win_rate_and_elephant_score(self, scraper, db):
+        """scrape() upserts TrackedTrader rows with non-null win_rate and elephant_score > 0."""
+        sample_merged = {
+            "whale_one": {
+                "nickname": "whale_one",
+                "pnl": 5000.0,
+                "volume": 40000.0,
+                "markets_traded": 12,
+                "rank_pnl": 3,
+                "rank_volume": 5,
+                "rank_markets": 2,
+            }
+        }
+
+        with patch.object(scraper, "fetch_all_metrics", new=AsyncMock(return_value=sample_merged)), \
+             patch.object(scraper, "is_rate_limited", return_value=False):
+            asyncio.run(scraper.scrape(db))
+
+        trader = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "whale_one"
+        ).first()
+        assert trader is not None, "scrape() must upsert at least one TrackedTrader"
+        assert trader.win_rate is not None, "win_rate must not be None"
+        assert trader.elephant_score is not None, "elephant_score must not be None"
+        assert trader.elephant_score > 0, "elephant_score must be positive for a ranked trader"
