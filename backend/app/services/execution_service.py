@@ -3,9 +3,10 @@
 import logging
 import math
 import uuid
+from datetime import datetime
 
 from app.config import settings
-from app.models import CopiedTrade, TradeSignal
+from app.models import CopiedTrade, PortfolioSnapshot, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,64 @@ def _kelly_position_pct(win_rate: float, price: float, max_pct: float) -> float 
     if half_kelly <= 0:
         return None
     return min(half_kelly, max_pct)
+
+
+def _check_risk_limits(db) -> str | None:
+    """
+    Check portfolio-level risk limits before placing an order.
+
+    Returns a human-readable reason string if a limit is breached, None otherwise.
+    Checks two guards:
+      1. max_total_exposure_pct — open CopiedTrade costs vs portfolio value.
+      2. max_daily_loss_pct    — today's realized PnL loss vs portfolio value.
+    """
+    # Reference portfolio value: latest snapshot or paper_balance_initial fallback
+    latest_snapshot: PortfolioSnapshot | None = (
+        db.query(PortfolioSnapshot)
+        .order_by(PortfolioSnapshot.created_at.desc())
+        .first()
+    )
+    portfolio_value = (
+        latest_snapshot.total_value
+        if latest_snapshot is not None
+        else settings.paper_balance_initial
+    )
+    if portfolio_value <= 0:
+        return None
+
+    # Guard 1: total open exposure
+    open_trades = (
+        db.query(CopiedTrade)
+        .filter(CopiedTrade.status.notin_(["settled", "cancelled"]))
+        .all()
+    )
+    total_exposure = sum(t.cost for t in open_trades)
+    exposure_limit = portfolio_value * settings.max_total_exposure_pct
+    if total_exposure >= exposure_limit:
+        return (
+            f"total open exposure {total_exposure:.2f} >= "
+            f"{settings.max_total_exposure_pct:.0%} limit ({exposure_limit:.2f})"
+        )
+
+    # Guard 2: daily realized loss
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    settled_today = (
+        db.query(CopiedTrade)
+        .filter(
+            CopiedTrade.settled_at >= today_start,
+            CopiedTrade.pnl.isnot(None),
+        )
+        .all()
+    )
+    daily_pnl = sum(t.pnl for t in settled_today)
+    loss_limit = portfolio_value * settings.max_daily_loss_pct
+    if daily_pnl <= -loss_limit:
+        return (
+            f"daily loss {-daily_pnl:.2f} >= "
+            f"{settings.max_daily_loss_pct:.0%} limit ({loss_limit:.2f})"
+        )
+
+    return None
 
 
 async def execute_signal(signal_id: int) -> None:
@@ -58,6 +117,13 @@ async def execute_signal(signal_id: int) -> None:
                 signal_id,
                 signal.detected_price,
             )
+            return
+
+        risk_error = _check_risk_limits(db)
+        if risk_error:
+            signal.status = "skipped"
+            db.commit()
+            logger.warning("Signal %d skipped by risk limit: %s", signal_id, risk_error)
             return
 
         if settings.dry_run:

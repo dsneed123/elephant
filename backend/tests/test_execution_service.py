@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,7 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
-from app.models import CopiedTrade, TradeSignal, TrackedTrader
+from app.models import CopiedTrade, PortfolioSnapshot, TradeSignal, TrackedTrader
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +211,8 @@ class TestExecuteSignal:
             mock_settings.dry_run = True
             mock_settings.max_position_pct = 0.05
             mock_settings.paper_balance_initial = 1000.0
+            mock_settings.max_total_exposure_pct = 0.30
+            mock_settings.max_daily_loss_pct = 0.10
 
             _run(execution_service.execute_signal(signal.id))
 
@@ -233,6 +236,8 @@ class TestExecuteSignal:
             mock_settings.dry_run = False
             mock_settings.max_position_pct = 0.05
             mock_settings.paper_balance_initial = 1000.0
+            mock_settings.max_total_exposure_pct = 0.30
+            mock_settings.max_daily_loss_pct = 0.10
 
             _run(execution_service.execute_signal(signal.id))
 
@@ -418,3 +423,157 @@ class TestKellyInExecuteSimulated:
         assert signal.status == "skipped"
         trade = db.query(CopiedTrade).filter_by(signal_id=signal.id).first()
         assert trade is None
+
+
+# ---------------------------------------------------------------------------
+# Portfolio-level risk limit guards in execute_signal
+# ---------------------------------------------------------------------------
+
+class TestRiskLimits:
+    """Tests for max_total_exposure_pct and max_daily_loss_pct guards."""
+
+    def _make_db_factory(self, db):
+        mock_db = MagicMock(wraps=db)
+        mock_db.close = MagicMock()
+        factory = MagicMock(return_value=mock_db)
+        return factory, mock_db
+
+    def _patch_settings(self, mock_settings):
+        mock_settings.dry_run = True
+        mock_settings.max_position_pct = 0.05
+        mock_settings.paper_balance_initial = 1000.0
+        mock_settings.max_total_exposure_pct = 0.30
+        mock_settings.max_daily_loss_pct = 0.10
+
+    def test_max_total_exposure_skips_signal(self, db):
+        """Signal is skipped when open trade costs breach max_total_exposure_pct."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        db.add(PortfolioSnapshot(
+            balance=1000.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+        ))
+        # 4 open trades × $80 = $320 > 30% of $1000 ($300)
+        for _ in range(4):
+            db.add(CopiedTrade(
+                signal_id=None,
+                market_ticker="OPEN-MARKET",
+                side="yes",
+                action="buy",
+                contracts=100,
+                price=0.80,
+                cost=80.0,
+                kalshi_order_id="open-order",
+                status="pending",
+                is_simulated=True,
+            ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        sim.assert_not_awaited()
+        db.refresh(signal)
+        assert signal.status == "skipped"
+
+    def test_max_daily_loss_skips_signal(self, db):
+        """Signal is skipped when today's realized loss breaches max_daily_loss_pct."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        db.add(PortfolioSnapshot(
+            balance=900.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+        ))
+        # Loss of $110 > 10% of $1000 ($100), settled today
+        db.add(CopiedTrade(
+            signal_id=None,
+            market_ticker="LOSS-MARKET",
+            side="yes",
+            action="buy",
+            contracts=100,
+            price=0.50,
+            cost=50.0,
+            kalshi_order_id="loss-order",
+            status="settled",
+            is_simulated=True,
+            pnl=-110.0,
+            settled_at=datetime.utcnow(),
+        ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        sim.assert_not_awaited()
+        db.refresh(signal)
+        assert signal.status == "skipped"
+
+    def test_within_limits_executes_normally(self, db):
+        """Signal routes to execution when both risk limits are satisfied."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        db.add(PortfolioSnapshot(
+            balance=1000.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+        ))
+        # Small open exposure: $50 < 30% of $1000
+        db.add(CopiedTrade(
+            signal_id=None,
+            market_ticker="SMALL-MARKET",
+            side="yes",
+            action="buy",
+            contracts=10,
+            price=0.50,
+            cost=5.0,
+            kalshi_order_id="small-order",
+            status="pending",
+            is_simulated=True,
+        ))
+        # Small settled loss today: $5 < 10% of $1000
+        db.add(CopiedTrade(
+            signal_id=None,
+            market_ticker="SMALL-LOSS",
+            side="yes",
+            action="buy",
+            contracts=10,
+            price=0.50,
+            cost=5.0,
+            kalshi_order_id="small-loss",
+            status="settled",
+            is_simulated=True,
+            pnl=-5.0,
+            settled_at=datetime.utcnow(),
+        ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        sim.assert_awaited_once()
