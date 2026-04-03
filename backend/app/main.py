@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings as app_settings
 from app.db import SessionLocal
+from app.middleware.auth import APIKeyMiddleware
 from app.websocket_manager import get_manager
 from app.models import CopiedTrade, PortfolioSnapshot
 from app.routers import traders, markets, portfolio, signals
@@ -241,6 +242,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(APIKeyMiddleware)
 
 app.include_router(traders.router, prefix="/api/traders", tags=["traders"])
 app.include_router(markets.router, prefix="/api/markets", tags=["markets"])
