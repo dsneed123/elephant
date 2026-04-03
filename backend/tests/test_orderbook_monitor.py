@@ -26,6 +26,7 @@ class TestDetectWhale:
         assert event.side == "yes"
         assert event.action == "buy"
         assert event.order_size == pytest.approx(1100.0)
+        assert event.price == 55
 
     def test_returns_none_below_threshold(self):
         msg = {"market_ticker": "INFL-25", "side": "yes", "price": 55, "delta": 100}
@@ -43,6 +44,7 @@ class TestDetectWhale:
         event = _detect_whale(msg)
         assert event is not None
         assert event.order_size == pytest.approx(1000.0)
+        assert event.price == 50
 
     def test_ignores_negative_delta(self):
         msg = {"market_ticker": "INFL-25", "side": "yes", "price": 55, "delta": -5000}
