@@ -1,7 +1,9 @@
 """Signal generation from order book whale events."""
 
+import asyncio
 import json
 import logging
+from datetime import datetime, timedelta
 
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -35,6 +37,24 @@ def _trader_tracks_market(trader: TrackedTrader, ticker: str) -> bool:
         return ticker in markets
     except (json.JSONDecodeError, TypeError):
         return False
+
+
+def expire_stale_signals(db: Session) -> int:
+    """Bulk-update pending signals older than signal_ttl_minutes to 'expired'."""
+    cutoff = datetime.utcnow() - timedelta(minutes=settings.signal_ttl_minutes)
+    updated = (
+        db.query(TradeSignal)
+        .filter(TradeSignal.status == "pending", TradeSignal.created_at < cutoff)
+        .update({"status": "expired"}, synchronize_session=False)
+    )
+    db.commit()
+    if updated:
+        logger.info(
+            "Expired %d stale signals (older than %d minutes)",
+            updated,
+            settings.signal_ttl_minutes,
+        )
+    return updated
 
 
 def process_whale_event(event: WhaleEvent, db: Session) -> list[TradeSignal]:
@@ -98,5 +118,22 @@ def process_whale_event(event: WhaleEvent, db: Session) -> list[TradeSignal]:
     db.commit()
     for sig in created:
         db.refresh(sig)
+
+    for sig in created:
+        if sig.confidence >= settings.auto_execute_threshold:
+            try:
+                from app.services.execution_service import execute_signal
+                loop = asyncio.get_running_loop()
+                loop.create_task(execute_signal(sig.id))
+                logger.info(
+                    "Scheduled auto-execution for signal %d (confidence=%.3f)",
+                    sig.id,
+                    sig.confidence,
+                )
+            except RuntimeError:
+                logger.warning(
+                    "No running event loop; signal %d left pending for manual review",
+                    sig.id,
+                )
 
     return created

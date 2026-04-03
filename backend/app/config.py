@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     # Signal generation settings
     min_signal_confidence: float = 0.7  # Minimum confidence to emit a signal
     min_elephant_score: float = 80.0  # Minimum elephant_score for signal candidates
+    whale_order_threshold: float = 1000.0  # Minimum USD order size to classify as whale
+    signal_ttl_minutes: int = 30  # Pending signals older than this are expired
+    auto_execute_threshold: float = 0.85  # Confidence threshold for automatic trade execution
 
     class Config:
         env_file = ".env"
