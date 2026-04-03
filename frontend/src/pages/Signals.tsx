@@ -2,13 +2,14 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { TradeSignal } from '../types'
 
-type StatusFilter = 'all' | 'pending' | 'copied' | 'skipped' | 'expired'
+type StatusFilter = 'all' | 'pending' | 'copied' | 'skipped' | 'expired' | 'dismissed'
 
 const STATUS_COLOR: Record<string, string> = {
   pending: 'bg-amber-500/20 text-amber-400',
   copied: 'bg-emerald-500/20 text-emerald-400',
   skipped: 'bg-zinc-700 text-zinc-400',
   expired: 'bg-red-500/20 text-red-400',
+  dismissed: 'bg-zinc-700 text-zinc-500',
 }
 
 export default function Signals() {
@@ -16,6 +17,8 @@ export default function Signals() {
   const [filter, setFilter] = useState<StatusFilter>('all')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [actionLoading, setActionLoading] = useState<Record<number, 'execute' | 'dismiss'>>({})
+  const [actionError, setActionError] = useState<Record<number, string>>({})
 
   const load = (f: StatusFilter) => {
     setLoading(true)
@@ -40,7 +43,25 @@ export default function Signals() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter])
 
-  const tabs: StatusFilter[] = ['all', 'pending', 'copied', 'skipped', 'expired']
+  const handleExecute = (id: number) => {
+    setActionLoading((prev) => ({ ...prev, [id]: 'execute' }))
+    setActionError((prev) => { const next = { ...prev }; delete next[id]; return next })
+    api.signals.execute(id)
+      .then(() => load(filter))
+      .catch((e: Error) => setActionError((prev) => ({ ...prev, [id]: e.message })))
+      .finally(() => setActionLoading((prev) => { const next = { ...prev }; delete next[id]; return next }))
+  }
+
+  const handleDismiss = (id: number) => {
+    setActionLoading((prev) => ({ ...prev, [id]: 'dismiss' }))
+    setActionError((prev) => { const next = { ...prev }; delete next[id]; return next })
+    api.signals.dismiss(id)
+      .then(() => load(filter))
+      .catch((e: Error) => setActionError((prev) => ({ ...prev, [id]: e.message })))
+      .finally(() => setActionLoading((prev) => { const next = { ...prev }; delete next[id]; return next }))
+  }
+
+  const tabs: StatusFilter[] = ['all', 'pending', 'copied', 'skipped', 'expired', 'dismissed']
 
   return (
     <div className="space-y-5">
@@ -87,6 +108,7 @@ export default function Signals() {
                 <th className="px-5 py-3 text-right">Confidence</th>
                 <th className="px-5 py-3 text-left">Status</th>
                 <th className="px-5 py-3 text-left">Created</th>
+                <th className="px-5 py-3 text-left">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800">
@@ -142,6 +164,29 @@ export default function Signals() {
                   </td>
                   <td className="px-5 py-3 text-zinc-500 text-xs">
                     {new Date(s.created_at).toLocaleString()}
+                  </td>
+                  <td className="px-5 py-3">
+                    {s.status === 'pending' && (
+                      <div className="flex gap-2 items-center">
+                        <button
+                          onClick={() => handleExecute(s.id)}
+                          disabled={!!actionLoading[s.id]}
+                          className="text-xs px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white transition-colors"
+                        >
+                          {actionLoading[s.id] === 'execute' ? '…' : 'Execute'}
+                        </button>
+                        <button
+                          onClick={() => handleDismiss(s.id)}
+                          disabled={!!actionLoading[s.id]}
+                          className="text-xs px-2.5 py-1 rounded bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 text-zinc-300 transition-colors"
+                        >
+                          {actionLoading[s.id] === 'dismiss' ? '…' : 'Dismiss'}
+                        </button>
+                        {actionError[s.id] && (
+                          <span className="text-xs text-red-400">{actionError[s.id]}</span>
+                        )}
+                      </div>
+                    )}
                   </td>
                 </tr>
               ))}

@@ -31,6 +31,16 @@ export const api = {
     list: (status?: string) =>
       get<TradeSignal[]>(`/signals/${status ? `?status=${status}` : ''}`),
     pending: () => get<TradeSignal[]>('/signals/pending'),
+    execute: (id: number) =>
+      fetch(`${BASE}/signals/${id}/execute`, { method: 'POST' }).then((r) => {
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+        return r.json() as Promise<CopiedTrade>
+      }),
+    dismiss: (id: number) =>
+      fetch(`${BASE}/signals/${id}/dismiss`, { method: 'POST' }).then((r) => {
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+        return r.json() as Promise<TradeSignal>
+      }),
   },
 
   portfolio: {
