@@ -25,7 +25,7 @@ export interface TradeSignal {
   detected_price: number
   detected_volume: number
   confidence: number
-  status: 'pending' | 'copied' | 'skipped' | 'expired'
+  status: 'pending' | 'copied' | 'skipped' | 'expired' | 'dismissed'
   created_at: string
 }
 
