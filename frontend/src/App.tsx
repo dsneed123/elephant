@@ -1,0 +1,22 @@
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import Layout from './components/Layout'
+import Dashboard from './pages/Dashboard'
+import Traders from './pages/Traders'
+import Signals from './pages/Signals'
+import Trades from './pages/Trades'
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<Layout />}>
+          <Route index element={<Navigate to="/dashboard" replace />} />
+          <Route path="dashboard" element={<Dashboard />} />
+          <Route path="traders" element={<Traders />} />
+          <Route path="signals" element={<Signals />} />
+          <Route path="trades" element={<Trades />} />
+        </Route>
+      </Routes>
+    </BrowserRouter>
+  )
+}
