@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   AreaChart,
   Area,
@@ -10,6 +10,7 @@ import {
 } from 'recharts'
 import { api } from '../api'
 import type { PortfolioPerformance, PortfolioSnapshot, TradeSignal } from '../types'
+import { useWebSocket } from '../hooks/useWebSocket'
 
 function StatCard({
   label,
@@ -68,6 +69,21 @@ export default function Dashboard() {
       })
       .catch((e: Error) => setError(e.message))
   }, [])
+
+  const perfRefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useWebSocket({
+    onSignalCreated: (signal) => {
+      setSignals((prev) => [signal, ...prev].slice(0, 8))
+    },
+    onTradeUpdated: () => {
+      // Debounce portfolio re-fetch so rapid events don't spam the API
+      if (perfRefetchTimer.current) clearTimeout(perfRefetchTimer.current)
+      perfRefetchTimer.current = setTimeout(() => {
+        api.portfolio.performance().then(setPerf).catch(() => {})
+      }, 1_000)
+    },
+  })
 
   if (error) {
     return (

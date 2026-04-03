@@ -39,7 +39,7 @@ export interface CopiedTrade {
   price: number
   cost: number
   kalshi_order_id: string | null
-  status: 'pending' | 'filled' | 'partial' | 'cancelled' | 'settled' | 'simulated'
+  status: 'pending' | 'filled' | 'partial' | 'cancelled' | 'settled' | 'simulated' | 'stopped_out'
   is_simulated: boolean
   pnl: number | null
   created_at: string
