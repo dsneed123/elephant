@@ -10,6 +10,26 @@ from app.models import CopiedTrade, TradeSignal
 logger = logging.getLogger(__name__)
 
 
+def _kelly_position_pct(win_rate: float, price: float, max_pct: float) -> float | None:
+    """
+    Compute half-Kelly position size as a fraction of portfolio.
+
+    Returns None if the Kelly fraction is <= 0 (no positive edge).
+    Caps at *max_pct* as a hard ceiling.
+
+    Args:
+        win_rate: Probability of winning in [0, 1].
+        price:    Market price in dollars (e.g. 0.40 for 40¢).
+        max_pct:  Hard cap as a fraction of portfolio.
+    """
+    b = 1.0 / price - 1.0  # net odds on a win
+    kelly_f = (win_rate * b - (1.0 - win_rate)) / b
+    half_kelly = kelly_f * 0.5
+    if half_kelly <= 0:
+        return None
+    return min(half_kelly, max_pct)
+
+
 async def execute_signal(signal_id: int) -> None:
     """
     Auto-execute a pending trade signal: place a Kalshi order and record a CopiedTrade.
@@ -75,7 +95,24 @@ async def _execute_simulated(db, signal: TradeSignal, price_cents: int) -> None:
     open_costs = sum(t.cost for t in open_simulated)
     paper_balance = settings.paper_balance_initial + settled_pnl - open_costs
 
-    max_spend = paper_balance * settings.max_position_pct
+    win_rate = signal.trader.win_rate if signal.trader else None
+    if win_rate is not None:
+        position_pct = _kelly_position_pct(win_rate, price_cents / 100, settings.max_position_pct)
+        if position_pct is None:
+            signal.status = "skipped"
+            db.commit()
+            logger.info(
+                "[DRY RUN] Signal %d skipped: negative Kelly edge "
+                "(win_rate=%.2f, price=%d¢)",
+                signal.id,
+                win_rate,
+                price_cents,
+            )
+            return
+    else:
+        position_pct = settings.max_position_pct
+
+    max_spend = paper_balance * position_pct
     count = max(1, math.floor(max_spend / (price_cents / 100)))
     fake_order_id = f"sim-{uuid.uuid4().hex[:12]}"
     cost = count * (price_cents / 100)
@@ -97,12 +134,14 @@ async def _execute_simulated(db, signal: TradeSignal, price_cents: int) -> None:
     db.commit()
 
     logger.info(
-        "[DRY RUN] Simulated signal %d: %s %s x%d @ %d¢ paper_order_id=%s paper_balance=%.2f",
+        "[DRY RUN] Simulated signal %d: %s %s x%d @ %d¢ "
+        "position_pct=%.3f paper_order_id=%s paper_balance=%.2f",
         signal.id,
         signal.market_ticker,
         signal.side,
         count,
         price_cents,
+        position_pct,
         fake_order_id,
         paper_balance,
     )
@@ -114,7 +153,24 @@ async def _execute_real(db, signal: TradeSignal, price_cents: int) -> None:
 
     client = get_kalshi_client()
     balance = await client.get_portfolio_balance()
-    max_spend = balance * settings.max_position_pct
+
+    win_rate = signal.trader.win_rate if signal.trader else None
+    if win_rate is not None:
+        position_pct = _kelly_position_pct(win_rate, price_cents / 100, settings.max_position_pct)
+        if position_pct is None:
+            signal.status = "skipped"
+            db.commit()
+            logger.info(
+                "Signal %d skipped: negative Kelly edge (win_rate=%.2f, price=%d¢)",
+                signal.id,
+                win_rate,
+                price_cents,
+            )
+            return
+    else:
+        position_pct = settings.max_position_pct
+
+    max_spend = balance * position_pct
     count = max(1, math.floor(max_spend / (price_cents / 100)))
 
     order = await client.place_order(
