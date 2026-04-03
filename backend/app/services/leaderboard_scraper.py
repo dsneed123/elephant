@@ -120,48 +120,57 @@ class LeaderboardScraper:
     # ------------------------------------------------------------------ #
 
     def _compute_elephant_score(
-        self, data: dict, win_rate: float = 0.0, consistency_score: float = 0.0
+        self,
+        data: dict,
+        win_rate: float = 0.0,
+        consistency_score: float = 0.0,
+        total_profit: float = 0.0,
+        total_trades: int = 0,
+        avg_position_size: float = 0.0,
+        last_seen: Optional[datetime] = None,
     ) -> float:
-        """Composite score (0-100) from available API data.
+        """Composite score (0-100) using spec-defined weights.
 
-        Base weights (from leaderboard API):
-          40%  PnL rank score      (top 1 = 1.0, rank 200 = 0.0)
-          25%  Volume rank score   (same scale)
-          20%  Market diversity    (log-scaled, 100 markets = 1.0)
-          15%  Cross-metric bonus  (appears in multiple leaderboards)
-
-        When real trade history is available (win_rate or consistency_score > 0),
-        a quality multiplier of up to +25% is applied based on those values.
+        Components:
+          30%  win_rate         (normalized 0-1)
+          25%  consistency      (consistency_score, 0-1)
+          20%  ROI              (total_profit / (total_trades * avg_position_size), capped 0-1)
+          15%  market_diversity (log-scaled, 100 markets = 1.0)
+          10%  recency          (exponential decay from last_seen, 30-day half-life)
         """
-        rank_pnl = data.get("rank_pnl", 999)
-        rank_volume = data.get("rank_volume", 999)
+        # win_rate component: directly 0-1
+        win_component = max(0.0, min(1.0, win_rate))
+
+        # consistency component: directly 0-1
+        consistency_component = max(0.0, min(1.0, consistency_score))
+
+        # ROI component: total_profit / (total_trades * avg_position_size), capped to [0, 1]
+        if total_trades > 0 and avg_position_size > 0.0:
+            roi_raw = total_profit / (total_trades * avg_position_size)
+            roi_component = max(0.0, min(1.0, roi_raw))
+        else:
+            roi_component = 0.0
+
+        # market_diversity component: log-scaled, 100 markets → 1.0
         markets = data.get("markets_traded", 0)
+        diversity_component = min(1.0, math.log1p(markets) / math.log1p(100)) if markets > 0 else 0.0
 
-        # Rank score: rank 1 → 1.0, rank 200+ → 0.0
-        pnl_score = max(0.0, 1.0 - (rank_pnl - 1) / 200)
-        vol_score = max(0.0, 1.0 - (rank_volume - 1) / 200)
-
-        # Market diversity: log-scaled, 100 markets → 1.0
-        diversity_score = min(1.0, math.log1p(markets) / math.log1p(100)) if markets > 0 else 0.0
-
-        # Cross-metric bonus: appears in multiple leaderboards
-        appearances = sum(1 for k in ("rank_pnl", "rank_volume", "rank_markets") if k in data)
-        cross_score = appearances / 3.0
+        # recency component: exponential decay, 30-day half-life
+        if last_seen is not None:
+            now = datetime.now(timezone.utc)
+            ls = last_seen if last_seen.tzinfo is not None else last_seen.replace(tzinfo=timezone.utc)
+            days_ago = max(0.0, (now - ls).total_seconds() / 86400.0)
+            recency_component = math.exp(-days_ago / 30.0)
+        else:
+            recency_component = 0.0
 
         raw = (
-            0.40 * pnl_score
-            + 0.25 * vol_score
-            + 0.20 * diversity_score
-            + 0.15 * cross_score
+            0.30 * win_component
+            + 0.25 * consistency_component
+            + 0.20 * roi_component
+            + 0.15 * diversity_component
+            + 0.10 * recency_component
         )
-
-        # Apply a quality multiplier when real trade history is available.
-        # win_edge: 0 at win_rate=0.5 (breakeven), 1.0 at win_rate=1.0
-        # Multiplier caps at 1.25 (+25% for a perfect win rate and consistency)
-        if win_rate > 0.0 or consistency_score > 0.0:
-            win_edge = max(0.0, (win_rate - 0.5) * 2.0)
-            quality = 0.60 * win_edge + 0.40 * consistency_score
-            raw = raw * (1.0 + 0.25 * quality)
 
         return round(min(1.0, raw) * 100.0, 2)
 
@@ -330,7 +339,13 @@ class LeaderboardScraper:
             trader = self._upsert_trader(db, data)
             update_trader_stats_from_history(db, trader)
             trader.elephant_score = self._compute_elephant_score(
-                data, trader.win_rate, trader.consistency_score
+                data,
+                win_rate=trader.win_rate or 0.0,
+                consistency_score=trader.consistency_score or 0.0,
+                total_profit=trader.total_profit or 0.0,
+                total_trades=trader.total_trades or 0,
+                avg_position_size=trader.avg_position_size or 0.0,
+                last_seen=trader.last_seen,
             )
             count += 1
 
