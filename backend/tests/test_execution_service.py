@@ -770,3 +770,115 @@ class TestCheckStopLosses:
         from app.services.execution_service import _get_exit_price_cents
 
         assert _get_exit_price_cents({}, "yes") is None
+
+
+# ---------------------------------------------------------------------------
+# _settle_real partial-fill handling
+# ---------------------------------------------------------------------------
+
+class TestSettleReal:
+    """Tests for settlement_service._settle_real partial/zero fill branches."""
+
+    def _make_live_trade(self, db, *, contracts=10, price=0.50, side="yes") -> CopiedTrade:
+        trade = CopiedTrade(
+            signal_id=None,
+            market_ticker="TEST-MARKET",
+            side=side,
+            action="buy",
+            contracts=contracts,
+            price=price,
+            cost=contracts * price,
+            kalshi_order_id=f"order-{uuid.uuid4().hex[:8]}",
+            status="pending",
+            is_simulated=False,
+        )
+        db.add(trade)
+        db.commit()
+        db.refresh(trade)
+        return trade
+
+    def test_partial_fill_updates_contracts_and_pnl(self, db):
+        """When only 6 of 10 contracts fill, trade.contracts==6 and PnL uses 6."""
+        from app.services import settlement_service
+
+        trade = self._make_live_trade(db, contracts=10, price=0.50, side="yes")
+
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(return_value={
+            "status": "filled",
+            "close_price": 100,
+            "yes_price": 50,
+            "filled_count": 6,
+        })
+
+        _run(settlement_service._settle_real(db, trade, mock_client))
+
+        db.refresh(trade)
+        assert trade.contracts == 6
+        assert trade.status == "partial"
+        assert trade.pnl == pytest.approx((100 - 50) * 6 / 100)
+        assert trade.settled_at is not None
+
+    def test_zero_fill_marks_cancelled(self, db):
+        """When filled_count==0, trade is marked cancelled and returns 0."""
+        from app.services import settlement_service
+
+        trade = self._make_live_trade(db, contracts=10, price=0.50)
+
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(return_value={
+            "status": "filled",
+            "close_price": 100,
+            "yes_price": 50,
+            "filled_count": 0,
+        })
+
+        result = _run(settlement_service._settle_real(db, trade, mock_client))
+
+        db.refresh(trade)
+        assert result == 0
+        assert trade.status == "cancelled"
+        assert trade.pnl is None
+
+    def test_full_fill_marks_settled_with_correct_contracts(self, db):
+        """When filled_count equals requested contracts, status is settled."""
+        from app.services import settlement_service
+
+        trade = self._make_live_trade(db, contracts=10, price=0.50)
+
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(return_value={
+            "status": "filled",
+            "close_price": 100,
+            "yes_price": 50,
+            "filled_count": 10,
+        })
+
+        result = _run(settlement_service._settle_real(db, trade, mock_client))
+
+        db.refresh(trade)
+        assert result == 1
+        assert trade.contracts == 10
+        assert trade.status == "settled"
+        assert trade.pnl == pytest.approx((100 - 50) * 10 / 100)
+
+    def test_no_fill_count_assumes_full_fill(self, db):
+        """When filled_count is absent, falls back to trade.contracts."""
+        from app.services import settlement_service
+
+        trade = self._make_live_trade(db, contracts=10, price=0.50)
+
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(return_value={
+            "status": "filled",
+            "close_price": 100,
+            "yes_price": 50,
+            # no filled_count key
+        })
+
+        result = _run(settlement_service._settle_real(db, trade, mock_client))
+
+        db.refresh(trade)
+        assert result == 1
+        assert trade.contracts == 10
+        assert trade.status == "settled"
