@@ -8,8 +8,29 @@ from typing import Optional
 
 from app.config import settings
 from app.models import CopiedTrade, PortfolioSnapshot, TradeSignal
+from app.websocket_manager import broadcast_event
 
 logger = logging.getLogger(__name__)
+
+
+def _trade_payload(trade: CopiedTrade) -> dict:
+    """Serialise a CopiedTrade to a JSON-safe dict for WebSocket broadcasts."""
+    return {
+        "id": trade.id,
+        "signal_id": trade.signal_id,
+        "market_ticker": trade.market_ticker,
+        "side": trade.side,
+        "action": trade.action,
+        "contracts": trade.contracts,
+        "price": trade.price,
+        "cost": trade.cost,
+        "kalshi_order_id": trade.kalshi_order_id,
+        "status": trade.status,
+        "is_simulated": trade.is_simulated,
+        "pnl": trade.pnl,
+        "created_at": trade.created_at.isoformat() if trade.created_at else None,
+        "settled_at": trade.settled_at.isoformat() if trade.settled_at else None,
+    }
 
 
 def _kelly_position_pct(win_rate: float, price: float, max_pct: float) -> float | None:
@@ -234,6 +255,7 @@ async def _execute_simulated(db, signal: TradeSignal, price_cents: int) -> None:
     db.add(copied)
     signal.status = "copied"
     db.commit()
+    db.refresh(copied)
 
     logger.info(
         "[DRY RUN] Simulated signal %d: %s %s x%d @ %d¢ "
@@ -248,6 +270,7 @@ async def _execute_simulated(db, signal: TradeSignal, price_cents: int) -> None:
         paper_balance,
     )
 
+    broadcast_event({"type": "trade_updated", "payload": _trade_payload(copied)})
     from app.services.notification_service import notify_trade_executed
     notify_trade_executed(copied, dry_run=True)
 
@@ -301,6 +324,7 @@ async def _execute_real(db, signal: TradeSignal, price_cents: int) -> None:
     db.add(copied)
     signal.status = "copied"
     db.commit()
+    db.refresh(copied)
 
     logger.info(
         "Auto-executed signal %d: %s %s x%d @ %d¢ order_id=%s",
@@ -312,6 +336,7 @@ async def _execute_real(db, signal: TradeSignal, price_cents: int) -> None:
         order.get("order_id"),
     )
 
+    broadcast_event({"type": "trade_updated", "payload": _trade_payload(copied)})
     from app.services.notification_service import notify_trade_executed
     notify_trade_executed(copied, dry_run=False)
 
@@ -415,6 +440,7 @@ async def _check_trade_stop_loss(db, trade: CopiedTrade, client) -> None:
             trade.market_ticker,
             unrealized_pnl,
         )
+        broadcast_event({"type": "trade_updated", "payload": _trade_payload(trade)})
         from app.services.notification_service import notify_stop_loss
         notify_stop_loss(trade)
         _maybe_notify_daily_loss_warning(db)
@@ -473,6 +499,7 @@ async def _close_trade_live(
         trade.market_ticker,
         unrealized_pnl,
     )
+    broadcast_event({"type": "trade_updated", "payload": _trade_payload(trade)})
     from app.services.notification_service import notify_stop_loss
     notify_stop_loss(trade)
     _maybe_notify_daily_loss_warning(db)
