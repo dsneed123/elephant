@@ -448,6 +448,7 @@ class TestRiskLimits:
         mock_settings.max_total_exposure_pct = 0.30
         mock_settings.max_daily_loss_pct = 0.10
         mock_settings.max_per_trader_exposure_pct = 0.15
+        mock_settings.max_drawdown_pct = 0.25
 
     def test_max_total_exposure_skips_signal(self, db):
         """Signal is skipped when open trade costs breach max_total_exposure_pct."""
@@ -739,6 +740,108 @@ class TestRiskLimits:
             _run(execution_service.execute_signal(signal.id))
 
         # Our trader has $0 open exposure → should execute
+        sim.assert_awaited_once()
+
+    def test_max_drawdown_skips_signal(self, db):
+        """Signal is skipped when portfolio has dropped more than max_drawdown_pct from its 30-day peak."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+        from datetime import timedelta
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        # Peak snapshot 15 days ago: $1000
+        peak_time = datetime.now(timezone.utc) - timedelta(days=15)
+        db.add(PortfolioSnapshot(
+            balance=1000.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+            created_at=peak_time,
+        ))
+        # Current snapshot: $700 → drawdown = 30% > 25% limit
+        db.add(PortfolioSnapshot(
+            balance=700.0, positions_value=0.0, total_value=700.0, total_pnl=-300.0,
+        ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            mock_settings.max_drawdown_pct = 0.25
+            _run(execution_service.execute_signal(signal.id))
+
+        sim.assert_not_awaited()
+        db.refresh(signal)
+        assert signal.status == "skipped"
+
+    def test_max_drawdown_within_limit_executes(self, db):
+        """Signal executes when drawdown from 30-day peak is below max_drawdown_pct."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+        from datetime import timedelta
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        # Peak snapshot 15 days ago: $1000
+        peak_time = datetime.now(timezone.utc) - timedelta(days=15)
+        db.add(PortfolioSnapshot(
+            balance=1000.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+            created_at=peak_time,
+        ))
+        # Current snapshot: $850 → drawdown = 15% < 25% limit
+        db.add(PortfolioSnapshot(
+            balance=850.0, positions_value=0.0, total_value=850.0, total_pnl=-150.0,
+        ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            mock_settings.max_drawdown_pct = 0.25
+            _run(execution_service.execute_signal(signal.id))
+
+        sim.assert_awaited_once()
+
+    def test_max_drawdown_ignores_snapshots_older_than_30_days(self, db):
+        """Peak snapshots older than 30 days are excluded from the drawdown calculation."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+        from datetime import timedelta
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        # Old peak 40 days ago: $10000 (outside the 30-day window, ignored)
+        old_peak_time = datetime.now(timezone.utc) - timedelta(days=40)
+        db.add(PortfolioSnapshot(
+            balance=10000.0, positions_value=0.0, total_value=10000.0, total_pnl=0.0,
+            created_at=old_peak_time,
+        ))
+        # Current snapshot within 30-day window: $850 (only snapshot in window)
+        db.add(PortfolioSnapshot(
+            balance=850.0, positions_value=0.0, total_value=850.0, total_pnl=0.0,
+        ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            mock_settings.max_drawdown_pct = 0.25
+            _run(execution_service.execute_signal(signal.id))
+
+        # Old peak is excluded; peak within window = current = 0% drawdown → executes
         sim.assert_awaited_once()
 
 

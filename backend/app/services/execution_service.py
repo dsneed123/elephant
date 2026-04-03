@@ -3,7 +3,7 @@
 import logging
 import math
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.config import settings
@@ -127,6 +127,24 @@ def _check_risk_limits(db, signal: TradeSignal) -> str | None:
             f"{trader_exposure:.2f} >= "
             f"{settings.max_per_trader_exposure_pct:.0%} limit ({trader_limit:.2f})"
         )
+
+    # Guard 4: max drawdown from 30-day peak
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    peak_snapshot: PortfolioSnapshot | None = (
+        db.query(PortfolioSnapshot)
+        .filter(PortfolioSnapshot.created_at >= thirty_days_ago)
+        .order_by(PortfolioSnapshot.total_value.desc())
+        .first()
+    )
+    if peak_snapshot is not None and peak_snapshot.total_value > 0:
+        peak_value = peak_snapshot.total_value
+        drawdown = (peak_value - portfolio_value) / peak_value
+        if drawdown >= settings.max_drawdown_pct:
+            return (
+                f"max drawdown {drawdown:.1%} >= "
+                f"{settings.max_drawdown_pct:.0%} limit "
+                f"(peak={peak_value:.2f} current={portfolio_value:.2f})"
+            )
 
     return None
 

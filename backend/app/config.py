@@ -17,9 +17,9 @@ class Settings(BaseSettings):
     min_trades: int = 20  # Minimum trades to qualify
 
     # Signal generation settings
-    min_signal_confidence: float = 0.55  # Minimum confidence to emit a signal
-    min_elephant_score: float = 40.0  # Minimum elephant_score for signal candidates
-    whale_order_threshold: float = 1000.0  # Minimum USD order size to classify as whale
+    min_signal_confidence: float = 0.50  # Minimum confidence to emit a signal
+    min_elephant_score: float = 30.0  # Minimum elephant_score for signal candidates
+    whale_order_threshold: float = 100.0  # Minimum USD order size to classify as whale
     signal_ttl_minutes: int = 30  # Pending signals older than this are expired
     auto_execute_threshold: float = 0.85  # Confidence threshold for automatic trade execution
 
@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     max_daily_loss_pct: float = 0.10  # Abort if today's realized loss exceeds 10% of portfolio
     max_total_exposure_pct: float = 0.30  # Abort if open trade costs exceed 30% of portfolio
     max_per_trader_exposure_pct: float = 0.15  # Abort if open costs for a single trader exceed 15% of portfolio
+    max_drawdown_pct: float = 0.25  # Block new trades if portfolio has dropped more than 25% from its 30-day peak
     stop_loss_pct: float = 0.20  # Close trade if unrealized loss exceeds 20% of entry cost
 
     # Paper trading / dry-run settings
