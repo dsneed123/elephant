@@ -14,9 +14,10 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import CopiedTrade, PortfolioSnapshot
 from app.routers import traders, markets, portfolio, signals
-from app.services.kalshi_client import get_kalshi_client
+from app.services.kalshi_client import get_kalshi_client, is_circuit_open
 from app.services.leaderboard_scraper import run_scrape
 from app.services.orderbook_monitor import get_monitor, run_orderbook_monitor
+from app.services.execution_service import check_stop_losses
 from app.services.settlement_service import settle_open_trades
 from app.services.signal_generator import expire_stale_signals
 
@@ -46,6 +47,17 @@ async def _settle_trades_job() -> None:
     db = SessionLocal()
     try:
         await settle_open_trades(db)
+    finally:
+        db.close()
+
+
+async def _check_stop_losses_job() -> None:
+    """APScheduler wrapper: open a DB session, check stop-losses, close."""
+    db = SessionLocal()
+    try:
+        await check_stop_losses(db)
+    except Exception:
+        logger.exception("_check_stop_losses_job failed")
     finally:
         db.close()
 
@@ -142,6 +154,14 @@ async def lifespan(app: FastAPI):
         id="expire_stale_signals",
         replace_existing=True,
     )
+    # Check per-trade stop-losses every 5 minutes
+    scheduler.add_job(
+        _check_stop_losses_job,
+        trigger="interval",
+        minutes=5,
+        id="check_stop_losses",
+        replace_existing=True,
+    )
     # Settle open trades and reconcile PnL every 15 minutes
     scheduler.add_job(
         _settle_trades_job,
@@ -168,7 +188,8 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info(
         "APScheduler started — leaderboard scrape every 6 hours, "
-        "signal expiry every 5 minutes, trade settlement every 15 minutes, "
+        "signal expiry every 5 minutes, stop-loss check every 5 minutes, "
+        "trade settlement every 15 minutes, "
         "portfolio snapshot every 30 minutes, order book monitor running"
     )
     if settings.dry_run:
@@ -208,4 +229,9 @@ app.include_router(signals.router, prefix="/api/signals", tags=["signals"])
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "elephant", **get_monitor().health_check()}
+    return {
+        "status": "ok",
+        "service": "elephant",
+        "circuit_open": is_circuit_open(),
+        **get_monitor().health_check(),
+    }

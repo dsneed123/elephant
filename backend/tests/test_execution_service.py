@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -577,3 +578,195 @@ class TestRiskLimits:
             _run(execution_service.execute_signal(signal.id))
 
         sim.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Stop-loss checks
+# ---------------------------------------------------------------------------
+
+class TestCheckStopLosses:
+    """Tests for check_stop_losses() and its helpers."""
+
+    def _make_open_trade(self, db, *, market_ticker="TEST-MARKET", side="yes",
+                         price=0.50, contracts=10, status="simulated") -> CopiedTrade:
+        trade = CopiedTrade(
+            signal_id=None,
+            market_ticker=market_ticker,
+            side=side,
+            action="buy",
+            contracts=contracts,
+            price=price,
+            cost=contracts * price,
+            kalshi_order_id=f"sim-{uuid.uuid4().hex[:8]}",
+            status=status,
+            is_simulated=True,
+        )
+        db.add(trade)
+        db.commit()
+        db.refresh(trade)
+        return trade
+
+    def test_stop_loss_triggered_dry_run(self, db):
+        """Trade is marked stopped_out when loss ratio exceeds stop_loss_pct in dry-run."""
+        from app.services.execution_service import check_stop_losses
+
+        # Entry 50¢, current bid 30¢ → loss = (0.50-0.30)*10 / 5.00 = 40% > 20%
+        trade = self._make_open_trade(db, price=0.50, contracts=10)
+        mock_client = MagicMock()
+        mock_client.get_market = AsyncMock(return_value={"yes_bid": 30})
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client), \
+             patch("app.services.execution_service.settings") as mock_settings:
+            mock_settings.stop_loss_pct = 0.20
+            mock_settings.dry_run = True
+            _run(check_stop_losses(db))
+
+        db.refresh(trade)
+        assert trade.status == "stopped_out"
+        assert trade.pnl == pytest.approx(-2.0)  # 10 * (0.30 - 0.50)
+        assert trade.settled_at is not None
+
+    def test_stop_loss_not_triggered_below_threshold(self, db):
+        """Trade is left open when loss is below stop_loss_pct."""
+        from app.services.execution_service import check_stop_losses
+
+        # Entry 50¢, current bid 45¢ → loss = (0.50-0.45)*10 / 5.00 = 10% < 20%
+        trade = self._make_open_trade(db, price=0.50, contracts=10)
+        mock_client = MagicMock()
+        mock_client.get_market = AsyncMock(return_value={"yes_bid": 45})
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client), \
+             patch("app.services.execution_service.settings") as mock_settings:
+            mock_settings.stop_loss_pct = 0.20
+            mock_settings.dry_run = True
+            _run(check_stop_losses(db))
+
+        db.refresh(trade)
+        assert trade.status == "simulated"  # unchanged
+        assert trade.pnl is None
+
+    def test_already_closed_trades_are_skipped(self, db):
+        """Settled and cancelled trades are not re-evaluated."""
+        from app.services.execution_service import check_stop_losses
+
+        settled = self._make_open_trade(db, status="settled")
+        cancelled = self._make_open_trade(db, status="cancelled")
+        stopped = self._make_open_trade(db, status="stopped_out")
+        mock_client = MagicMock()
+        mock_client.get_market = AsyncMock(return_value={"yes_bid": 1})
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client), \
+             patch("app.services.execution_service.settings") as mock_settings:
+            mock_settings.stop_loss_pct = 0.20
+            mock_settings.dry_run = True
+            _run(check_stop_losses(db))
+
+        # get_market should never be called since no eligible open trades
+        mock_client.get_market.assert_not_awaited()
+
+    def test_market_fetch_failure_skips_trade(self, db):
+        """If get_market() raises, the trade is left unchanged (will retry next run)."""
+        from app.services.execution_service import check_stop_losses
+
+        trade = self._make_open_trade(db, price=0.50, contracts=10)
+        mock_client = MagicMock()
+        mock_client.get_market = AsyncMock(side_effect=Exception("network error"))
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client), \
+             patch("app.services.execution_service.settings") as mock_settings:
+            mock_settings.stop_loss_pct = 0.20
+            mock_settings.dry_run = True
+            _run(check_stop_losses(db))
+
+        db.refresh(trade)
+        assert trade.status == "simulated"  # unchanged
+
+    def test_no_price_in_market_data_skips_trade(self, db):
+        """When market data contains no bid/last_price, trade is left unchanged."""
+        from app.services.execution_service import check_stop_losses
+
+        trade = self._make_open_trade(db, price=0.50, contracts=10)
+        mock_client = MagicMock()
+        mock_client.get_market = AsyncMock(return_value={})  # no price fields
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client), \
+             patch("app.services.execution_service.settings") as mock_settings:
+            mock_settings.stop_loss_pct = 0.20
+            mock_settings.dry_run = True
+            _run(check_stop_losses(db))
+
+        db.refresh(trade)
+        assert trade.status == "simulated"
+
+    def test_stop_loss_live_cancel_success(self, db):
+        """In live mode a successful cancel_order marks the trade stopped_out."""
+        from app.services.execution_service import check_stop_losses
+
+        trade = self._make_open_trade(db, price=0.50, contracts=10, status="pending")
+        trade.is_simulated = False
+        db.commit()
+
+        mock_client = MagicMock()
+        mock_client.get_market = AsyncMock(return_value={"yes_bid": 30})
+        mock_client.cancel_order = AsyncMock(return_value={"order_id": trade.kalshi_order_id})
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client), \
+             patch("app.services.execution_service.settings") as mock_settings:
+            mock_settings.stop_loss_pct = 0.20
+            mock_settings.dry_run = False
+            _run(check_stop_losses(db))
+
+        db.refresh(trade)
+        assert trade.status == "stopped_out"
+        mock_client.cancel_order.assert_awaited_once_with(trade.kalshi_order_id)
+
+    def test_stop_loss_live_cancel_fails_places_sell(self, db):
+        """In live mode when cancel_order fails, a closing sell order is placed."""
+        from app.services.execution_service import check_stop_losses
+
+        trade = self._make_open_trade(db, price=0.50, contracts=10, status="filled")
+        trade.is_simulated = False
+        db.commit()
+
+        mock_client = MagicMock()
+        mock_client.get_market = AsyncMock(return_value={"yes_bid": 30})
+        mock_client.cancel_order = AsyncMock(side_effect=Exception("already filled"))
+        mock_client.place_order = AsyncMock(return_value={"order_id": "close-order-id"})
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client), \
+             patch("app.services.execution_service.settings") as mock_settings:
+            mock_settings.stop_loss_pct = 0.20
+            mock_settings.dry_run = False
+            _run(check_stop_losses(db))
+
+        db.refresh(trade)
+        assert trade.status == "stopped_out"
+        mock_client.place_order.assert_awaited_once_with(
+            ticker=trade.market_ticker,
+            side=trade.side,
+            count=trade.contracts,
+            price=30,
+            action="sell",
+        )
+
+    def test_get_exit_price_uses_no_bid_for_no_side(self, db):
+        """_get_exit_price_cents returns no_bid for NO-side trades."""
+        from app.services.execution_service import _get_exit_price_cents
+
+        market = {"yes_bid": 40, "no_bid": 58, "last_price": 42}
+        assert _get_exit_price_cents(market, "no") == 58
+        assert _get_exit_price_cents(market, "yes") == 40
+
+    def test_get_exit_price_falls_back_to_last_price(self, db):
+        """_get_exit_price_cents falls back to last_price when bid is absent."""
+        from app.services.execution_service import _get_exit_price_cents
+
+        market = {"last_price": 35}
+        assert _get_exit_price_cents(market, "yes") == 35
+        assert _get_exit_price_cents(market, "no") == 35
+
+    def test_get_exit_price_returns_none_when_no_data(self, db):
+        """_get_exit_price_cents returns None when no price fields are present."""
+        from app.services.execution_service import _get_exit_price_cents
+
+        assert _get_exit_price_cents({}, "yes") is None

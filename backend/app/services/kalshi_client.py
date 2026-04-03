@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import enum
 import functools
 import logging
 import random
@@ -20,23 +21,112 @@ _RETRY_MAX_ATTEMPTS = 3
 _RETRY_BASE_DELAY = 1.0   # seconds
 _RETRY_MAX_DELAY = 30.0   # seconds
 
+# Circuit breaker parameters
+_CB_FAILURE_THRESHOLD = 5    # consecutive failures within _CB_FAILURE_WINDOW
+_CB_FAILURE_WINDOW = 60.0    # seconds
+_CB_RECOVERY_TIMEOUT = 30.0  # seconds in OPEN state before trying HALF_OPEN
+
+
+class KalshiCircuitOpenError(Exception):
+    """Raised when the Kalshi API circuit breaker is open; no retries are attempted."""
+
+
+class _CBState(enum.Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class _CircuitBreaker:
+    """Three-state circuit breaker (CLOSED → OPEN → HALF_OPEN → CLOSED).
+
+    CLOSED:    normal operation; failures are counted in a rolling time window.
+    OPEN:      all calls fail immediately with KalshiCircuitOpenError for
+               _CB_RECOVERY_TIMEOUT seconds.
+    HALF_OPEN: a single probe call is allowed through; success closes the
+               circuit, failure re-opens it.
+    """
+
+    def __init__(self) -> None:
+        self._state = _CBState.CLOSED
+        self._failure_times: list[float] = []
+        self._opened_at: float = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        return self._state == _CBState.OPEN
+
+    @property
+    def state(self) -> str:
+        return self._state.value
+
+    def check(self) -> None:
+        """Raise KalshiCircuitOpenError if the circuit should block the call."""
+        if self._state == _CBState.CLOSED:
+            return
+        if self._state == _CBState.OPEN:
+            if time.monotonic() - self._opened_at >= _CB_RECOVERY_TIMEOUT:
+                self._state = _CBState.HALF_OPEN
+                logger.info("Circuit breaker → HALF_OPEN (testing recovery)")
+            else:
+                raise KalshiCircuitOpenError(
+                    "Kalshi API circuit breaker is OPEN; retry after %.0fs"
+                    % (_CB_RECOVERY_TIMEOUT - (time.monotonic() - self._opened_at))
+                )
+        # HALF_OPEN: let the probe call through
+
+    def record_success(self) -> None:
+        if self._state == _CBState.HALF_OPEN:
+            self._state = _CBState.CLOSED
+            self._failure_times.clear()
+            logger.info("Circuit breaker → CLOSED (recovery confirmed)")
+
+    def record_failure(self) -> None:
+        now = time.monotonic()
+        if self._state == _CBState.HALF_OPEN:
+            self._state = _CBState.OPEN
+            self._opened_at = now
+            logger.warning("Circuit breaker → OPEN (probe failed)")
+            return
+        # CLOSED: track failures in rolling window
+        self._failure_times = [t for t in self._failure_times if now - t < _CB_FAILURE_WINDOW]
+        self._failure_times.append(now)
+        if len(self._failure_times) >= _CB_FAILURE_THRESHOLD:
+            self._state = _CBState.OPEN
+            self._opened_at = now
+            logger.warning(
+                "Circuit breaker → OPEN (%d failures within %.0fs window)",
+                len(self._failure_times),
+                _CB_FAILURE_WINDOW,
+            )
+
 
 def _with_retry(fn):
     """Decorator: retry on 429, 5xx, and network timeouts with exponential backoff + jitter.
 
     Rules:
+    - Circuit breaker: if self._circuit_breaker is OPEN, raise KalshiCircuitOpenError
+      immediately before each attempt (no retries while open).
     - 429: respect Retry-After header if present, else backoff. Max 3 retries.
     - 5xx: exponential backoff with jitter. Max 3 retries.
     - httpx.TimeoutException: exponential backoff with jitter. Max 3 retries.
-    - Other 4xx: raise immediately (no retry).
+    - Other 4xx: raise immediately (no retry, does not trip circuit breaker).
     """
 
     @functools.wraps(fn)
     async def wrapper(self, *args, **kwargs):
+        cb = getattr(self, "_circuit_breaker", None)
         for attempt in range(_RETRY_MAX_ATTEMPTS + 1):
+            if cb is not None:
+                cb.check()  # raises KalshiCircuitOpenError if open
             try:
-                return await fn(self, *args, **kwargs)
+                result = await fn(self, *args, **kwargs)
+                if cb is not None:
+                    cb.record_success()
+                return result
             except httpx.TimeoutException as exc:
+                if cb is not None:
+                    cb.record_failure()
                 if attempt == _RETRY_MAX_ATTEMPTS:
                     raise
                 delay = _backoff_delay(attempt)
@@ -48,6 +138,8 @@ def _with_retry(fn):
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 if status == 429:
+                    if cb is not None:
+                        cb.record_failure()
                     if attempt == _RETRY_MAX_ATTEMPTS:
                         raise
                     delay = _retry_after_delay(exc.response, attempt)
@@ -57,6 +149,8 @@ def _with_retry(fn):
                     )
                     await asyncio.sleep(delay)
                 elif 500 <= status < 600:
+                    if cb is not None:
+                        cb.record_failure()
                     if attempt == _RETRY_MAX_ATTEMPTS:
                         raise
                     delay = _backoff_delay(attempt)
@@ -66,7 +160,7 @@ def _with_retry(fn):
                     )
                     await asyncio.sleep(delay)
                 else:
-                    raise
+                    raise  # 4xx client errors do not trip the circuit breaker
 
     return wrapper
 
@@ -130,6 +224,8 @@ class KalshiClient:
         # 10 writes/sec, 20 reads/sec
         self._write_bucket = _TokenBucket(rate=10.0)
         self._read_bucket = _TokenBucket(rate=20.0)
+
+        self._circuit_breaker = _CircuitBreaker()
 
     # ------------------------------------------------------------------ #
     # Key loading & signing                                                #
@@ -212,6 +308,7 @@ class KalshiClient:
         side: str,
         count: int,
         price: int,
+        action: str = "buy",
     ) -> dict:
         """Place a limit order. Returns the full order object (includes order_id)."""
         payload = {
@@ -221,7 +318,7 @@ class KalshiClient:
             "type": "limit",
             "yes_price": price if side == "yes" else 100 - price,
             "no_price": price if side == "no" else 100 - price,
-            "action": "buy",
+            "action": action,
         }
         data = await self._post("/portfolio/orders", json=payload)
         return data.get("order", data)
@@ -257,3 +354,10 @@ def get_kalshi_client() -> KalshiClient:
         kalshi_client = KalshiClient()
         _client_initialized = True
     return kalshi_client
+
+
+def is_circuit_open() -> bool:
+    """Return True if the KalshiClient circuit breaker is currently OPEN."""
+    if not _client_initialized:
+        return False
+    return kalshi_client._circuit_breaker.is_open

@@ -1,12 +1,23 @@
 """Tests for KalshiClient retry logic."""
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
-from app.services.kalshi_client import _backoff_delay, _retry_after_delay, _with_retry
+from app.services.kalshi_client import (
+    _CircuitBreaker,
+    _backoff_delay,
+    _retry_after_delay,
+    _with_retry,
+    KalshiCircuitOpenError,
+    _CB_FAILURE_THRESHOLD,
+    _CB_FAILURE_WINDOW,
+    _CB_RECOVERY_TIMEOUT,
+    _RETRY_MAX_ATTEMPTS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -159,3 +170,135 @@ class TestRetryLogging:
         with caplog.at_level(logging.WARNING, logger="app.services.kalshi_client"):
             run(obj.call())
         assert any("server error 503" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker helpers
+# ---------------------------------------------------------------------------
+
+def _make_cb_method(side_effects):
+    """Build a minimal object with @_with_retry AND a _circuit_breaker."""
+
+    class _CBDummy:
+        def __init__(self):
+            self._circuit_breaker = _CircuitBreaker()
+
+        @_with_retry
+        async def call(self):
+            effect = side_effects.pop(0)
+            if isinstance(effect, Exception):
+                raise effect
+            return effect
+
+    return _CBDummy()
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker state transitions
+# ---------------------------------------------------------------------------
+
+class TestCircuitBreakerTransitions:
+    def test_opens_after_failure_threshold(self):
+        """5 consecutive record_failure() calls within the window should open the circuit."""
+        cb = _CircuitBreaker()
+        for _ in range(_CB_FAILURE_THRESHOLD - 1):
+            cb.record_failure()
+        assert not cb.is_open
+
+        cb.record_failure()  # 5th failure trips the breaker
+        assert cb.is_open
+
+    def test_open_circuit_raises_immediately_no_sleep(self, no_sleep):
+        """Once open, calls should raise KalshiCircuitOpenError without any sleep."""
+        obj = _make_cb_method(["ok"])  # would succeed if circuit allowed
+        # Open the circuit directly
+        for _ in range(_CB_FAILURE_THRESHOLD):
+            obj._circuit_breaker.record_failure()
+
+        with pytest.raises(KalshiCircuitOpenError):
+            run(obj.call())
+        no_sleep.assert_not_awaited()
+
+    def test_transitions_to_half_open_after_recovery_timeout(self):
+        """After _CB_RECOVERY_TIMEOUT seconds, an OPEN circuit should allow one probe."""
+        cb = _CircuitBreaker()
+        for _ in range(_CB_FAILURE_THRESHOLD):
+            cb.record_failure()
+        assert cb.is_open
+
+        # Simulate recovery timeout by rewinding _opened_at
+        cb._opened_at -= _CB_RECOVERY_TIMEOUT + 1
+
+        cb.check()  # should not raise, transitions to HALF_OPEN
+        assert cb.state == "half_open"
+
+    def test_closes_on_half_open_success(self):
+        """A successful probe in HALF_OPEN state should close the circuit."""
+        cb = _CircuitBreaker()
+        from app.services.kalshi_client import _CBState
+        cb._state = _CBState.HALF_OPEN
+
+        cb.record_success()
+
+        assert cb.state == "closed"
+        assert not cb.is_open
+
+    def test_reopens_on_half_open_failure(self):
+        """A failed probe in HALF_OPEN state should re-open the circuit."""
+        cb = _CircuitBreaker()
+        from app.services.kalshi_client import _CBState
+        cb._state = _CBState.HALF_OPEN
+
+        cb.record_failure()
+
+        assert cb.is_open
+
+    def test_failures_outside_window_do_not_open_circuit(self, monkeypatch):
+        """Failures older than _CB_FAILURE_WINDOW should not count toward the threshold."""
+        cb = _CircuitBreaker()
+        fake_time = time.monotonic()
+
+        # Record failures that are just outside the window
+        with patch("time.monotonic", return_value=fake_time - _CB_FAILURE_WINDOW - 1):
+            for _ in range(_CB_FAILURE_THRESHOLD - 1):
+                cb.record_failure()
+
+        # Now record one more failure in the present — still under threshold
+        with patch("time.monotonic", return_value=fake_time):
+            cb.record_failure()
+
+        assert not cb.is_open
+
+    def test_successful_call_closes_half_open_via_decorator(self):
+        """End-to-end: open circuit → recovery timeout → successful probe → closed."""
+        obj = _make_cb_method(["ok"])
+        # Open circuit directly
+        for _ in range(_CB_FAILURE_THRESHOLD):
+            obj._circuit_breaker.record_failure()
+        assert obj._circuit_breaker.is_open
+
+        # Simulate recovery
+        obj._circuit_breaker._opened_at -= _CB_RECOVERY_TIMEOUT + 1
+
+        result = run(obj.call())
+        assert result == "ok"
+        assert obj._circuit_breaker.state == "closed"
+
+    def test_4xx_errors_do_not_trip_circuit(self):
+        """Client errors (non-429 4xx) should not count as circuit failures."""
+        cb = _CircuitBreaker()
+
+        class _4xxDummy:
+            def __init__(self):
+                self._circuit_breaker = cb
+
+            @_with_retry
+            async def call(self):
+                raise _make_http_error(403)
+
+        obj = _4xxDummy()
+        for _ in range(_CB_FAILURE_THRESHOLD + 1):
+            with pytest.raises(httpx.HTTPStatusError):
+                run(obj.call())
+
+        assert not cb.is_open
