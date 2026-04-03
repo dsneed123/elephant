@@ -130,7 +130,9 @@ def process_whale_event(event: WhaleEvent, db: Session) -> list[TradeSignal]:
         if sig.confidence >= settings.auto_execute_threshold:
             from app.main import scheduler
             from app.services.execution_service import execute_signal
+            from app.services.notification_service import notify_high_confidence_signal
             scheduler.add_job(execute_signal, trigger="date", args=[sig.id])
+            notify_high_confidence_signal(sig)
             logger.info(
                 "Scheduled auto-execution for signal %d (confidence=%.3f)",
                 sig.id,

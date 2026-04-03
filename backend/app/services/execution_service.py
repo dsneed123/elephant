@@ -90,6 +90,39 @@ def _check_risk_limits(db) -> str | None:
     return None
 
 
+def _maybe_notify_daily_loss_warning(db) -> None:
+    """Fire a daily loss warning if today's loss has exceeded 80% of the daily limit."""
+    latest_snapshot: PortfolioSnapshot | None = (
+        db.query(PortfolioSnapshot)
+        .order_by(PortfolioSnapshot.created_at.desc())
+        .first()
+    )
+    portfolio_value = (
+        latest_snapshot.total_value
+        if latest_snapshot is not None
+        else settings.paper_balance_initial
+    )
+    if portfolio_value <= 0:
+        return
+
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    settled_today = (
+        db.query(CopiedTrade)
+        .filter(
+            CopiedTrade.settled_at >= today_start,
+            CopiedTrade.pnl.isnot(None),
+        )
+        .all()
+    )
+    daily_pnl = sum(t.pnl for t in settled_today)
+    loss_limit = portfolio_value * settings.max_daily_loss_pct
+    warning_threshold = loss_limit * 0.8
+
+    if daily_pnl <= -warning_threshold:
+        from app.services.notification_service import notify_daily_loss_warning
+        notify_daily_loss_warning(-daily_pnl, portfolio_value)
+
+
 async def execute_signal(signal_id: int) -> None:
     """
     Auto-execute a pending trade signal: place a Kalshi order and record a CopiedTrade.
@@ -126,6 +159,8 @@ async def execute_signal(signal_id: int) -> None:
             db.commit()
             logger.warning("Signal %d skipped by risk limit: %s", signal_id, risk_error)
             return
+
+        _maybe_notify_daily_loss_warning(db)
 
         if settings.dry_run:
             await _execute_simulated(db, signal, price_cents)
@@ -213,6 +248,9 @@ async def _execute_simulated(db, signal: TradeSignal, price_cents: int) -> None:
         paper_balance,
     )
 
+    from app.services.notification_service import notify_trade_executed
+    notify_trade_executed(copied, dry_run=True)
+
 
 async def _execute_real(db, signal: TradeSignal, price_cents: int) -> None:
     """Place a live order via the Kalshi API."""
@@ -273,6 +311,9 @@ async def _execute_real(db, signal: TradeSignal, price_cents: int) -> None:
         price_cents,
         order.get("order_id"),
     )
+
+    from app.services.notification_service import notify_trade_executed
+    notify_trade_executed(copied, dry_run=False)
 
 
 def _get_exit_price_cents(market: dict, side: str) -> Optional[int]:
@@ -374,6 +415,9 @@ async def _check_trade_stop_loss(db, trade: CopiedTrade, client) -> None:
             trade.market_ticker,
             unrealized_pnl,
         )
+        from app.services.notification_service import notify_stop_loss
+        notify_stop_loss(trade)
+        _maybe_notify_daily_loss_warning(db)
     else:
         await _close_trade_live(db, trade, client, unrealized_pnl, current_price_cents)
 
@@ -429,3 +473,6 @@ async def _close_trade_live(
         trade.market_ticker,
         unrealized_pnl,
     )
+    from app.services.notification_service import notify_stop_loss
+    notify_stop_loss(trade)
+    _maybe_notify_daily_loss_warning(db)
