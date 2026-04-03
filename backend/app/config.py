@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     dry_run: bool = True  # When True, simulate orders instead of calling Kalshi API
     paper_balance_initial: float = 1000.0  # Starting paper balance in dollars for dry-run mode
 
+    # Webhook notifications
+    webhook_url: str = ""  # Discord-compatible webhook URL; empty disables notifications
+    webhook_enabled: bool = False  # Set True to enable webhook notifications
+
     class Config:
         env_file = ".env"
 
