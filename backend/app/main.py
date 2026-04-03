@@ -14,6 +14,7 @@ from app.db import SessionLocal
 from app.routers import traders, markets, portfolio, signals
 from app.services.leaderboard_scraper import run_scrape
 from app.services.orderbook_monitor import run_orderbook_monitor
+from app.services.settlement_service import settle_open_trades
 from app.services.signal_generator import expire_stale_signals
 
 _ALEMBIC_INI = os.path.join(os.path.dirname(__file__), "..", "alembic.ini")
@@ -33,6 +34,15 @@ async def _expire_signals_job() -> None:
     db = SessionLocal()
     try:
         expire_stale_signals(db)
+    finally:
+        db.close()
+
+
+async def _settle_trades_job() -> None:
+    """APScheduler wrapper: open a DB session, settle open trades, close."""
+    db = SessionLocal()
+    try:
+        await settle_open_trades(db)
     finally:
         db.close()
 
@@ -59,6 +69,14 @@ async def lifespan(app: FastAPI):
         id="expire_stale_signals",
         replace_existing=True,
     )
+    # Settle open trades and reconcile PnL every 15 minutes
+    scheduler.add_job(
+        _settle_trades_job,
+        trigger="interval",
+        minutes=15,
+        id="settle_open_trades",
+        replace_existing=True,
+    )
     # Start WebSocket order book monitor immediately as a background task
     scheduler.add_job(
         run_orderbook_monitor,
@@ -69,7 +87,8 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info(
         "APScheduler started — leaderboard scrape every 6 hours, "
-        "signal expiry every 5 minutes, order book monitor running"
+        "signal expiry every 5 minutes, trade settlement every 15 minutes, "
+        "order book monitor running"
     )
 
     yield
