@@ -3,6 +3,7 @@
 import asyncio
 import json
 import math
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -52,49 +53,106 @@ def _make_http_response(status_code: int, json_body: dict) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 class TestComputeElephantScore:
-    def test_rank1_all_metrics_returns_100(self, scraper):
-        data = {"rank_pnl": 1, "rank_volume": 1, "rank_markets": 1, "markets_traded": 100}
-        score = scraper._compute_elephant_score(data)
-        assert score == pytest.approx(100.0, abs=0.1)
-
-    def test_no_rank_data_returns_zero(self, scraper):
-        # rank defaults to 999 → pnl_score=0, vol_score=0; markets=0; cross=0
+    def test_all_zero_inputs_returns_zero(self, scraper):
+        # No win_rate, consistency, ROI, markets, or last_seen → 0
         score = scraper._compute_elephant_score({})
         assert score == pytest.approx(0.0, abs=0.01)
 
-    def test_pnl_rank1_contributes_correctly(self, scraper):
-        # rank_pnl=1 → pnl_score=1.0, cross_score=1/3
-        data = {"rank_pnl": 1}
-        score = scraper._compute_elephant_score(data)
-        expected = round((0.40 * 1.0 + 0.15 * (1 / 3)) * 100.0, 2)
-        assert score == pytest.approx(expected, abs=0.01)
+    def test_perfect_win_rate_contributes_30pct(self, scraper):
+        score = scraper._compute_elephant_score({}, win_rate=1.0)
+        assert score == pytest.approx(30.0, abs=0.01)
 
-    def test_rank_201_gives_zero_pnl_score(self, scraper):
-        # pnl_score = max(0, 1 - 200/200) = 0; cross_score = 1/3
-        data = {"rank_pnl": 201}
-        score = scraper._compute_elephant_score(data)
-        expected = round(0.15 * (1 / 3) * 100.0, 2)
-        assert score == pytest.approx(expected, abs=0.01)
+    def test_perfect_consistency_contributes_25pct(self, scraper):
+        score = scraper._compute_elephant_score({}, consistency_score=1.0)
+        assert score == pytest.approx(25.0, abs=0.01)
 
-    def test_diversity_log_scaled(self, scraper):
-        # markets_traded=100 → diversity_score=1.0; no rank keys
+    def test_roi_component_contributes_20pct(self, scraper):
+        # ROI = 100 / (1 * 100) = 1.0 → capped at 1.0
+        score = scraper._compute_elephant_score(
+            {}, total_profit=100.0, total_trades=1, avg_position_size=100.0
+        )
+        assert score == pytest.approx(20.0, abs=0.01)
+
+    def test_roi_capped_at_1(self, scraper):
+        # Very high ROI should still contribute only 20%
+        score = scraper._compute_elephant_score(
+            {}, total_profit=99999.0, total_trades=1, avg_position_size=1.0
+        )
+        assert score == pytest.approx(20.0, abs=0.01)
+
+    def test_roi_zero_when_no_trades(self, scraper):
+        # total_trades=0 → roi_component=0
+        score = scraper._compute_elephant_score(
+            {}, total_profit=1000.0, total_trades=0, avg_position_size=100.0
+        )
+        assert score == pytest.approx(0.0, abs=0.01)
+
+    def test_roi_negative_clamped_to_zero(self, scraper):
+        # Negative total_profit should not reduce score below 0
+        score = scraper._compute_elephant_score(
+            {}, total_profit=-500.0, total_trades=5, avg_position_size=100.0
+        )
+        assert score == pytest.approx(0.0, abs=0.01)
+
+    def test_diversity_log_scaled_contributes_15pct(self, scraper):
+        # markets_traded=100 → diversity_component=1.0 → 15%
         data = {"markets_traded": 100}
         score = scraper._compute_elephant_score(data)
-        expected = round(0.20 * 1.0 * 100.0, 2)
-        assert score == pytest.approx(expected, abs=0.01)
+        assert score == pytest.approx(15.0, abs=0.01)
 
-    def test_cross_metric_bonus_all_three_present(self, scraper):
-        # rank keys present but beyond 200; only cross contributes
-        data = {"rank_pnl": 999, "rank_volume": 999, "rank_markets": 999}
-        score = scraper._compute_elephant_score(data)
-        expected = round(0.15 * 1.0 * 100.0, 2)
-        assert score == pytest.approx(expected, abs=0.01)
+    def test_diversity_partial(self, scraper):
+        markets = 30
+        expected_diversity = math.log1p(markets) / math.log1p(100)
+        score = scraper._compute_elephant_score({"markets_traded": markets})
+        assert score == pytest.approx(0.15 * expected_diversity * 100.0, abs=0.01)
 
-    def test_cross_metric_bonus_one_metric(self, scraper):
-        data = {"rank_pnl": 999}
-        score = scraper._compute_elephant_score(data)
-        expected = round(0.15 * (1 / 3) * 100.0, 2)
-        assert score == pytest.approx(expected, abs=0.01)
+    def test_recency_recent_trader_contributes_10pct(self, scraper):
+        now = datetime.now(timezone.utc)
+        score = scraper._compute_elephant_score({}, last_seen=now)
+        assert score == pytest.approx(10.0, abs=0.05)
+
+    def test_recency_30_day_old_decays_by_exp_minus_1(self, scraper):
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=30)
+        score = scraper._compute_elephant_score({}, last_seen=old)
+        expected = 10.0 * math.exp(-1.0)
+        assert score == pytest.approx(expected, abs=0.1)
+
+    def test_recency_none_contributes_zero(self, scraper):
+        score = scraper._compute_elephant_score({}, last_seen=None)
+        assert score == pytest.approx(0.0, abs=0.01)
+
+    def test_recency_naive_datetime_treated_as_utc(self, scraper):
+        naive_now = datetime.utcnow()  # no tzinfo
+        score = scraper._compute_elephant_score({}, last_seen=naive_now)
+        assert score == pytest.approx(10.0, abs=0.1)
+
+    def test_full_score_all_perfect_equals_100(self, scraper):
+        now = datetime.now(timezone.utc)
+        score = scraper._compute_elephant_score(
+            {"markets_traded": 100},
+            win_rate=1.0,
+            consistency_score=1.0,
+            total_profit=100.0,
+            total_trades=1,
+            avg_position_size=100.0,
+            last_seen=now,
+        )
+        assert score == pytest.approx(100.0, abs=0.1)
+
+    def test_weights_sum_is_correct(self, scraper):
+        # Verify weights sum to 1.0 by checking max achievable score is 100
+        now = datetime.now(timezone.utc)
+        score = scraper._compute_elephant_score(
+            {"markets_traded": 100},
+            win_rate=1.0,
+            consistency_score=1.0,
+            total_profit=1.0,
+            total_trades=1,
+            avg_position_size=1.0,
+            last_seen=now,
+        )
+        assert score <= 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +362,14 @@ class TestUpsertTrader:
         assert trader.total_profit == 9000.0
 
     def test_existing_trader_elephant_score_recalculated(self, scraper, db):
-        data = self._base_data(rank_pnl=50)
+        # First upsert with few markets traded → low diversity component
+        data = self._base_data(markets_traded=1)
         scraper._upsert_trader(db, data)
         db.commit()
         old_score = db.query(TrackedTrader).first().elephant_score
 
-        data["rank_pnl"] = 1
+        # Second upsert with many markets traded → higher diversity component
+        data["markets_traded"] = 100
         scraper._upsert_trader(db, data)
         db.commit()
         new_score = db.query(TrackedTrader).first().elephant_score
@@ -485,23 +545,24 @@ class TestUpdateTraderStatsFromHistory:
         update_trader_stats_from_history(db, trader)
         assert trader.total_trades == 1
 
-    def test_elephant_score_boosted_with_good_history(self, scraper):
-        """Positive win_rate above 0.5 should yield a higher score than without history."""
-        data = {"rank_pnl": 5, "rank_volume": 5, "rank_markets": 5, "markets_traded": 30}
+    def test_elephant_score_higher_with_good_win_rate_and_consistency(self, scraper):
+        """High win_rate and consistency produce a higher score than diversity alone."""
+        data = {"markets_traded": 30}
         base_score = scraper._compute_elephant_score(data)
         boosted_score = scraper._compute_elephant_score(data, win_rate=0.80, consistency_score=0.7)
         assert boosted_score > base_score
 
-    def test_elephant_score_unchanged_for_breakeven_win_rate(self, scraper):
-        """win_rate=0.5 at the edge → win_edge=0 but consistency_score>0 still applies."""
-        data = {"rank_pnl": 5}
-        score_no_history = scraper._compute_elephant_score(data)
-        score_with_history = scraper._compute_elephant_score(
-            data, win_rate=0.5, consistency_score=0.0
+    def test_elephant_score_additive_components(self, scraper):
+        """Each component contributes independently to the total score."""
+        now = datetime.now(timezone.utc)
+        score_win_only = scraper._compute_elephant_score({}, win_rate=0.6)
+        score_roi_only = scraper._compute_elephant_score(
+            {}, total_profit=60.0, total_trades=1, avg_position_size=100.0
         )
-        # win_rate=0.5 → win_edge=0; consistency=0 → quality=0 → no multiplier applied
-        # BUT the condition `win_rate > 0.0` triggers the block → raw * (1 + 0) = raw unchanged
-        assert score_with_history == pytest.approx(score_no_history, abs=0.01)
+        score_both = scraper._compute_elephant_score(
+            {}, win_rate=0.6, total_profit=60.0, total_trades=1, avg_position_size=100.0
+        )
+        assert score_both == pytest.approx(score_win_only + score_roi_only, abs=0.01)
 
 
 # ---------------------------------------------------------------------------
