@@ -4,6 +4,7 @@ import type {
   CopiedTrade,
   PortfolioPerformance,
   PortfolioSnapshot,
+  AppSettings,
 } from './types'
 
 const BASE = '/api'
@@ -48,5 +49,18 @@ export const api = {
     performance: () => get<PortfolioPerformance>('/portfolio/performance'),
     snapshots: (limit = 100) =>
       get<PortfolioSnapshot[]>(`/portfolio/snapshots?limit=${limit}`),
+  },
+
+  settings: {
+    get: () => get<AppSettings>('/settings/'),
+    patch: (data: Partial<AppSettings>) =>
+      fetch(`${BASE}/settings/`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      }).then((r) => {
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+        return r.json() as Promise<AppSettings>
+      }),
   },
 }

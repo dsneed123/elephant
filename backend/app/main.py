@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.db import SessionLocal
 from app.models import CopiedTrade, PortfolioSnapshot
-from app.routers import traders, markets, portfolio, signals
+from app.routers import traders, markets, portfolio, signals, settings
 from app.services.kalshi_client import get_kalshi_client, is_circuit_open
 from app.services.leaderboard_scraper import run_scrape
 from app.services.orderbook_monitor import get_monitor, run_orderbook_monitor
@@ -225,6 +225,7 @@ app.include_router(traders.router, prefix="/api/traders", tags=["traders"])
 app.include_router(markets.router, prefix="/api/markets", tags=["markets"])
 app.include_router(portfolio.router, prefix="/api/portfolio", tags=["portfolio"])
 app.include_router(signals.router, prefix="/api/signals", tags=["signals"])
+app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 
 
 @app.get("/api/health")
