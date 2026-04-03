@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # Portfolio risk limits
     max_daily_loss_pct: float = 0.10  # Abort if today's realized loss exceeds 10% of portfolio
     max_total_exposure_pct: float = 0.30  # Abort if open trade costs exceed 30% of portfolio
+    stop_loss_pct: float = 0.20  # Close trade if unrealized loss exceeds 20% of entry cost
 
     # Paper trading / dry-run settings
     dry_run: bool = True  # When True, simulate orders instead of calling Kalshi API

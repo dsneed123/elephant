@@ -4,6 +4,7 @@ import logging
 import math
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 from app.config import settings
 from app.models import CopiedTrade, PortfolioSnapshot, TradeSignal
@@ -271,4 +272,160 @@ async def _execute_real(db, signal: TradeSignal, price_cents: int) -> None:
         count,
         price_cents,
         order.get("order_id"),
+    )
+
+
+def _get_exit_price_cents(market: dict, side: str) -> Optional[int]:
+    """Extract the current exit (bid) price in cents from market data for the given side.
+
+    Uses the bid price (what you'd receive closing the position) so the stop-loss
+    threshold is evaluated against a realistic exit value.  Falls back to
+    ``last_price`` when no bid is available.
+    """
+    if side == "yes":
+        price = market.get("yes_bid") or market.get("last_price")
+    else:
+        price = market.get("no_bid") or market.get("last_price")
+    if price is None:
+        return None
+    return int(price)
+
+
+async def check_stop_losses(db) -> None:
+    """Check open trades for stop-loss conditions and close them if the threshold is exceeded.
+
+    For each open CopiedTrade, fetches the current market price via
+    ``kalshi_client.get_market()``, computes unrealized PnL, and triggers a
+    close when the loss ratio (−pnl / cost) exceeds ``settings.stop_loss_pct``.
+
+    In dry-run mode the trade is marked ``stopped_out`` with the simulated loss
+    and no real orders are placed.  In live mode the open order is cancelled
+    first; if cancellation fails (order already filled) a closing sell order is
+    placed instead.
+
+    Opens its own DB session so it can be called directly from an APScheduler job.
+    """
+    import app.services.kalshi_client as _kalshi_mod
+
+    open_trades = (
+        db.query(CopiedTrade)
+        .filter(CopiedTrade.status.notin_(["settled", "cancelled", "stopped_out"]))
+        .all()
+    )
+    if not open_trades:
+        return
+
+    client = _kalshi_mod.get_kalshi_client()
+    for trade in open_trades:
+        try:
+            await _check_trade_stop_loss(db, trade, client)
+        except Exception:
+            logger.exception(
+                "Stop-loss check failed for trade %d (%s); will retry next run",
+                trade.id,
+                trade.market_ticker,
+            )
+
+
+async def _check_trade_stop_loss(db, trade: CopiedTrade, client) -> None:
+    """Evaluate and apply stop-loss for a single open trade."""
+    try:
+        market = await client.get_market(trade.market_ticker)
+    except Exception:
+        logger.warning(
+            "Could not fetch market %s for stop-loss check on trade %d; skipping",
+            trade.market_ticker,
+            trade.id,
+        )
+        return
+
+    current_price_cents = _get_exit_price_cents(market, trade.side)
+    if current_price_cents is None:
+        return
+
+    current_price = current_price_cents / 100
+    entry_price = trade.price  # stored in dollars
+    unrealized_pnl = trade.contracts * (current_price - entry_price)
+    loss_ratio = (-unrealized_pnl / trade.cost) if trade.cost > 0 else 0.0
+
+    if loss_ratio < settings.stop_loss_pct:
+        return
+
+    logger.warning(
+        "Stop-loss triggered for trade %d (%s %s): entry=%.2f current=%.2f "
+        "loss=%.1f%% threshold=%.1f%%",
+        trade.id,
+        trade.market_ticker,
+        trade.side,
+        entry_price,
+        current_price,
+        loss_ratio * 100,
+        settings.stop_loss_pct * 100,
+    )
+
+    if settings.dry_run:
+        trade.pnl = unrealized_pnl
+        trade.status = "stopped_out"
+        trade.settled_at = datetime.now(timezone.utc)
+        db.commit()
+        logger.info(
+            "[DRY RUN] Stopped out simulated trade %d (%s): pnl=%.4f",
+            trade.id,
+            trade.market_ticker,
+            unrealized_pnl,
+        )
+    else:
+        await _close_trade_live(db, trade, client, unrealized_pnl, current_price_cents)
+
+
+async def _close_trade_live(
+    db,
+    trade: CopiedTrade,
+    client,
+    unrealized_pnl: float,
+    current_price_cents: int,
+) -> None:
+    """Cancel or close a live trade that has hit its stop-loss."""
+    cancelled = False
+    try:
+        await client.cancel_order(trade.kalshi_order_id)
+        cancelled = True
+        logger.info(
+            "Cancelled order %s for stop-loss trade %d",
+            trade.kalshi_order_id,
+            trade.id,
+        )
+    except Exception:
+        logger.warning(
+            "Could not cancel order %s for trade %d (may already be filled); "
+            "attempting closing sell order",
+            trade.kalshi_order_id,
+            trade.id,
+        )
+
+    if not cancelled:
+        try:
+            await client.place_order(
+                ticker=trade.market_ticker,
+                side=trade.side,
+                count=trade.contracts,
+                price=current_price_cents,
+                action="sell",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to place closing sell order for trade %d; manual intervention required",
+                trade.id,
+            )
+            return
+
+    trade.pnl = unrealized_pnl
+    trade.status = "stopped_out"
+    trade.settled_at = datetime.now(timezone.utc)
+    db.commit()
+    logger.info(
+        "Stopped out live trade %d (%s): pnl=%.4f",
+        trade.id,
+        trade.market_ticker,
+        unrealized_pnl,
     )
