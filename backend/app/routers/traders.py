@@ -1,8 +1,11 @@
 """Tracked traders endpoints."""
 
+import json
 from datetime import datetime
+from typing import List
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -10,6 +13,10 @@ from app.models import TrackedTrader
 from app.services.leaderboard_scraper import scraper
 
 router = APIRouter()
+
+
+class MarketsUpdate(BaseModel):
+    markets: List[str]
 
 
 @router.get("/")
@@ -39,6 +46,23 @@ def get_trader(username: str, db: Session = Depends(get_db)):
     ).first()
     if not trader:
         return {"error": "Trader not found"}
+    return trader
+
+
+@router.patch("/{username}/markets")
+def update_trader_markets(
+    username: str,
+    payload: MarketsUpdate,
+    db: Session = Depends(get_db),
+):
+    """Manually override a trader's top_markets list."""
+    trader = db.query(TrackedTrader).filter(
+        TrackedTrader.kalshi_username == username
+    ).first()
+    if not trader:
+        raise HTTPException(status_code=404, detail="Trader not found")
+    trader.top_markets = json.dumps(payload.markets)
+    db.commit()
     return trader
 
 
