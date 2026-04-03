@@ -356,10 +356,11 @@ class LeaderboardScraper:
         Composite elephant score (0–100).
 
         Weights:
-          40%  win_rate          (0–1)
-          30%  profit score      (log-scaled, $10k → 1.0)
-          15%  consistency_score (0–1)
+          30%  win_rate          (0–1)
+          25%  consistency_score (0–1)
+          20%  ROI score         (log-scaled, $10k → 1.0)
           15%  market_diversity  (normalised, cap 20 markets)
+          10%  recency           (1.0 within 7 days, linear decay to 0 at 90 days)
         """
         win_rate = max(0.0, min(1.0, data.get("win_rate", 0.0)))
         profit = data.get("total_profit", 0.0)
@@ -369,11 +370,24 @@ class LeaderboardScraper:
         profit_score = min(1.0, math.log1p(profit) / math.log1p(10_000)) if profit > 0 else 0.0
         diversity_score = min(1.0, diversity / 20.0)
 
+        last_active: Optional[datetime] = data.get("last_active")
+        if last_active is None:
+            recency_score = 1.0  # appearing in current scrape means active now
+        else:
+            days = (datetime.utcnow() - last_active).days
+            if days <= 7:
+                recency_score = 1.0
+            elif days >= 90:
+                recency_score = 0.0
+            else:
+                recency_score = 1.0 - (days - 7) / (90 - 7)
+
         raw = (
-            0.40 * win_rate
-            + 0.30 * profit_score
-            + 0.15 * consistency
+            0.30 * win_rate
+            + 0.25 * consistency
+            + 0.20 * profit_score
             + 0.15 * diversity_score
+            + 0.10 * recency_score
         )
         return round(raw * 100.0, 2)
 
