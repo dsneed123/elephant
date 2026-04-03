@@ -4,6 +4,7 @@ import type {
   CopiedTrade,
   PortfolioPerformance,
   PortfolioSnapshot,
+  TraderPnl,
   AppSettings,
 } from './types'
 
@@ -49,6 +50,7 @@ export const api = {
     performance: () => get<PortfolioPerformance>('/portfolio/performance'),
     snapshots: (limit = 100) =>
       get<PortfolioSnapshot[]>(`/portfolio/snapshots?limit=${limit}`),
+    traderPnl: () => get<TraderPnl[]>('/portfolio/traders'),
   },
 
   settings: {

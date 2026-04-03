@@ -65,6 +65,18 @@ export interface AppSettings {
   paper_balance: number
 }
 
+export interface TraderPnl {
+  kalshi_username: string
+  display_name: string | null
+  elephant_score: number
+  tier: string
+  total_pnl: number
+  win_rate: number
+  trade_count: number
+  total_cost: number
+  roi: number
+}
+
 export interface PortfolioSnapshot {
   id: number
   balance: number

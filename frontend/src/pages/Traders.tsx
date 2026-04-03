@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { TrackedTrader } from '../types'
+import type { TrackedTrader, TraderPnl } from '../types'
 
 const TIER_COLOR: Record<string, string> = {
   top_001: 'bg-yellow-500/20 text-yellow-300',
@@ -9,10 +9,11 @@ const TIER_COLOR: Record<string, string> = {
   top_10: 'bg-zinc-700 text-zinc-400',
 }
 
-type SortKey = 'elephant_score' | 'win_rate' | 'total_profit' | 'total_trades'
+type SortKey = 'elephant_score' | 'win_rate' | 'total_profit' | 'total_trades' | 'pnl'
 
 export default function Traders() {
   const [traders, setTraders] = useState<TrackedTrader[]>([])
+  const [pnlMap, setPnlMap] = useState<Record<string, TraderPnl>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('elephant_score')
@@ -20,10 +21,12 @@ export default function Traders() {
   const [scrapeMsg, setScrapeMsg] = useState<string | null>(null)
 
   useEffect(() => {
-    api.traders
-      .list()
-      .then((data) => {
-        setTraders(data)
+    Promise.all([api.traders.list(), api.portfolio.traderPnl()])
+      .then(([tradersData, pnlData]) => {
+        setTraders(tradersData)
+        const map: Record<string, TraderPnl> = {}
+        for (const entry of pnlData) map[entry.kalshi_username] = entry
+        setPnlMap(map)
         setLoading(false)
       })
       .catch((e: Error) => {
@@ -32,7 +35,14 @@ export default function Traders() {
       })
   }, [])
 
-  const sorted = [...traders].sort((a, b) => b[sortKey] - a[sortKey])
+  const sorted = [...traders].sort((a, b) => {
+    if (sortKey === 'pnl') {
+      const aPnl = pnlMap[a.kalshi_username]?.total_pnl ?? -Infinity
+      const bPnl = pnlMap[b.kalshi_username]?.total_pnl ?? -Infinity
+      return bPnl - aPnl
+    }
+    return b[sortKey] - a[sortKey]
+  })
 
   const handleScrape = () => {
     setScraping(true)
@@ -86,6 +96,7 @@ export default function Traders() {
         <SortBtn k="win_rate" label="Win Rate" />
         <SortBtn k="total_profit" label="Profit" />
         <SortBtn k="total_trades" label="Trades" />
+        <SortBtn k="pnl" label="P&L" />
       </div>
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
@@ -108,6 +119,8 @@ export default function Traders() {
                 <th className="px-5 py-3 text-right">Win Rate</th>
                 <th className="px-5 py-3 text-right">Total Profit</th>
                 <th className="px-5 py-3 text-right">Trades</th>
+                <th className="px-5 py-3 text-right">Copied P&L</th>
+                <th className="px-5 py-3 text-right">ROI</th>
                 <th className="px-5 py-3 text-center">Active</th>
               </tr>
             </thead>
@@ -144,6 +157,39 @@ export default function Traders() {
                     {t.total_profit >= 0 ? '+' : ''}${t.total_profit.toFixed(2)}
                   </td>
                   <td className="px-5 py-3 text-right text-zinc-400">{t.total_trades}</td>
+                  <td
+                    className={`px-5 py-3 text-right font-mono ${
+                      pnlMap[t.kalshi_username] === undefined
+                        ? 'text-zinc-600'
+                        : pnlMap[t.kalshi_username].total_pnl >= 0
+                        ? 'text-emerald-400'
+                        : 'text-red-400'
+                    }`}
+                  >
+                    {pnlMap[t.kalshi_username] !== undefined ? (
+                      <>
+                        {pnlMap[t.kalshi_username].total_pnl >= 0 ? '+' : ''}
+                        ${pnlMap[t.kalshi_username].total_pnl.toFixed(2)}
+                      </>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
+                  <td className="px-5 py-3 text-right text-zinc-400">
+                    {pnlMap[t.kalshi_username] !== undefined ? (
+                      <span
+                        className={
+                          pnlMap[t.kalshi_username].roi >= 0
+                            ? 'text-emerald-400'
+                            : 'text-red-400'
+                        }
+                      >
+                        {(pnlMap[t.kalshi_username].roi * 100).toFixed(1)}%
+                      </span>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
                   <td className="px-5 py-3 text-center">
                     <span
                       className={`inline-block w-2 h-2 rounded-full ${

@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import get_db
-from app.models import CopiedTrade, PortfolioSnapshot
+from app.models import CopiedTrade, PortfolioSnapshot, TradeSignal, TrackedTrader
 from app.services.kalshi_client import get_kalshi_client
 
 logger = logging.getLogger(__name__)
@@ -69,6 +69,53 @@ async def portfolio_performance(db: Session = Depends(get_db)):
         "total_trades": total_trades,
         "win_rate": winning / total_trades if total_trades > 0 else 0,
     }
+
+
+@router.get("/traders")
+def trader_pnl_attribution(db: Session = Depends(get_db)):
+    """Return settled P&L grouped by the copied trader, sorted by total_pnl desc."""
+    rows = (
+        db.query(CopiedTrade, TrackedTrader)
+        .join(TradeSignal, CopiedTrade.signal_id == TradeSignal.id)
+        .join(TrackedTrader, TradeSignal.trader_id == TrackedTrader.id)
+        .filter(CopiedTrade.status == "settled", CopiedTrade.pnl.isnot(None))
+        .all()
+    )
+
+    by_trader: dict[str, dict] = {}
+    for trade, trader in rows:
+        entry = by_trader.setdefault(
+            trader.kalshi_username,
+            {
+                "kalshi_username": trader.kalshi_username,
+                "display_name": trader.display_name,
+                "elephant_score": trader.elephant_score,
+                "tier": trader.tier,
+                "_trades": [],
+            },
+        )
+        entry["_trades"].append(trade)
+
+    result = []
+    for info in by_trader.values():
+        trades = info.pop("_trades")
+        trade_count = len(trades)
+        total_pnl = sum(t.pnl for t in trades)
+        total_cost = sum(t.cost for t in trades)
+        winners = sum(1 for t in trades if t.pnl > 0)
+        result.append(
+            {
+                **info,
+                "total_pnl": total_pnl,
+                "win_rate": winners / trade_count,
+                "trade_count": trade_count,
+                "total_cost": total_cost,
+                "roi": total_pnl / total_cost if total_cost > 0 else 0.0,
+            }
+        )
+
+    result.sort(key=lambda x: x["total_pnl"], reverse=True)
+    return result
 
 
 @router.get("/snapshots")
