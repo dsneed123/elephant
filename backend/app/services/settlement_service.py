@@ -1,7 +1,7 @@
 """Trade settlement and PnL reconciliation service."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -85,7 +85,7 @@ async def _settle_simulated(db: Session, trade: CopiedTrade, client) -> int:
 
     trade.pnl = pnl
     trade.status = "settled"
-    trade.settled_at = datetime.utcnow()
+    trade.settled_at = datetime.now(timezone.utc)
     db.commit()
 
     logger.info(
@@ -162,7 +162,7 @@ async def _settle_real(db: Session, trade: CopiedTrade, client) -> int:
 
     trade.pnl = pnl
     trade.status = "partial" if filled_count < originally_requested else "settled"
-    trade.settled_at = datetime.utcnow()
+    trade.settled_at = datetime.now(timezone.utc)
     db.commit()
 
     logger.info(

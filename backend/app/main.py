@@ -7,11 +7,12 @@ from contextlib import asynccontextmanager
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db import SessionLocal
+from app.websocket_manager import get_manager
 from app.models import CopiedTrade, PortfolioSnapshot
 from app.routers import traders, markets, portfolio, signals, settings
 from app.services.kalshi_client import get_kalshi_client, is_circuit_open
@@ -226,6 +227,18 @@ app.include_router(markets.router, prefix="/api/markets", tags=["markets"])
 app.include_router(portfolio.router, prefix="/api/portfolio", tags=["portfolio"])
 app.include_router(signals.router, prefix="/api/signals", tags=["signals"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket) -> None:
+    manager = get_manager()
+    await manager.connect(ws)
+    try:
+        while True:
+            # Keep the connection alive; clients don't send messages to the server.
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(ws)
 
 
 @app.get("/api/health")

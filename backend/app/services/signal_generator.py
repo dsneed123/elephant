@@ -2,13 +2,14 @@
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import TrackedTrader, TradeSignal
+from app.websocket_manager import broadcast_event
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ def _trader_tracks_market(trader: TrackedTrader, ticker: str) -> bool:
 
 def expire_stale_signals(db: Session) -> int:
     """Bulk-update pending signals older than signal_ttl_minutes to 'expired'."""
-    cutoff = datetime.utcnow() - timedelta(minutes=settings.signal_ttl_minutes)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.signal_ttl_minutes)
     updated = (
         db.query(TradeSignal)
         .filter(TradeSignal.status == "pending", TradeSignal.created_at < cutoff)
@@ -125,6 +126,24 @@ def process_whale_event(event: WhaleEvent, db: Session) -> list[TradeSignal]:
     db.commit()
     for sig in created:
         db.refresh(sig)
+
+    for sig in created:
+        broadcast_event({
+            "type": "signal_created",
+            "payload": {
+                "id": sig.id,
+                "trader_id": sig.trader_id,
+                "market_ticker": sig.market_ticker,
+                "market_title": sig.market_title,
+                "side": sig.side,
+                "action": sig.action,
+                "detected_price": sig.detected_price,
+                "detected_volume": sig.detected_volume,
+                "confidence": sig.confidence,
+                "status": sig.status,
+                "created_at": sig.created_at.isoformat() if sig.created_at else None,
+            },
+        })
 
     for sig in created:
         if sig.confidence >= settings.auto_execute_threshold:
