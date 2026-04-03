@@ -10,8 +10,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
-from app.models import TrackedTrader
-from app.services.leaderboard_scraper import LeaderboardScraper
+from app.models import CopiedTrade, TradeSignal, TrackedTrader
+from app.services.leaderboard_scraper import LeaderboardScraper, update_trader_stats_from_history
 
 
 # ---------------------------------------------------------------------------
@@ -346,3 +346,158 @@ class TestScrapePipelineEndToEnd:
         assert trader.win_rate is not None, "win_rate must not be None"
         assert trader.elephant_score is not None, "elephant_score must not be None"
         assert trader.elephant_score > 0, "elephant_score must be positive for a ranked trader"
+
+
+# ---------------------------------------------------------------------------
+# update_trader_stats_from_history
+# ---------------------------------------------------------------------------
+
+def _make_trader(db, username="testtrader") -> TrackedTrader:
+    trader = TrackedTrader(
+        kalshi_username=username,
+        display_name=username,
+        win_rate=0.0,
+        consistency_score=0.0,
+        total_trades=0,
+        elephant_score=50.0,
+        tier="ranked",
+        is_active=True,
+    )
+    db.add(trader)
+    db.flush()  # assign trader.id
+    return trader
+
+
+def _make_settled_trade(db, trader: TrackedTrader, pnl: float, status="settled") -> CopiedTrade:
+    signal = TradeSignal(
+        trader_id=trader.id,
+        market_ticker="MKTTEST",
+        side="yes",
+        action="buy",
+        detected_price=50.0,
+        status="copied",
+    )
+    db.add(signal)
+    db.flush()
+
+    trade = CopiedTrade(
+        signal_id=signal.id,
+        market_ticker="MKTTEST",
+        side="yes",
+        action="buy",
+        contracts=10,
+        price=0.50,
+        cost=5.0,
+        kalshi_order_id="ord-test",
+        status=status,
+        is_simulated=True,
+        pnl=pnl,
+    )
+    db.add(trade)
+    db.flush()
+    return trade
+
+
+class TestUpdateTraderStatsFromHistory:
+    def test_no_history_leaves_stats_at_zero(self, db):
+        trader = _make_trader(db)
+        update_trader_stats_from_history(db, trader)
+        assert trader.win_rate == 0.0
+        assert trader.consistency_score == 0.0
+        assert trader.total_trades == 0
+
+    def test_new_trader_with_no_id_returns_early(self, db):
+        trader = TrackedTrader(
+            kalshi_username="newbie",
+            display_name="newbie",
+            win_rate=0.0,
+            consistency_score=0.0,
+            total_trades=0,
+            elephant_score=10.0,
+            tier="ranked",
+            is_active=True,
+        )
+        # id is None — not yet flushed
+        update_trader_stats_from_history(db, trader)
+        assert trader.win_rate == 0.0
+
+    def test_win_rate_computed_correctly(self, db):
+        trader = _make_trader(db)
+        _make_settled_trade(db, trader, pnl=5.0)   # win
+        _make_settled_trade(db, trader, pnl=3.0)   # win
+        _make_settled_trade(db, trader, pnl=-2.0)  # loss
+        _make_settled_trade(db, trader, pnl=-1.0)  # loss
+        update_trader_stats_from_history(db, trader)
+        assert trader.total_trades == 4
+        assert trader.win_rate == pytest.approx(0.5, abs=0.01)
+
+    def test_all_wins_gives_win_rate_one(self, db):
+        trader = _make_trader(db)
+        for _ in range(5):
+            _make_settled_trade(db, trader, pnl=4.0)
+        update_trader_stats_from_history(db, trader)
+        assert trader.win_rate == pytest.approx(1.0, abs=0.01)
+
+    def test_all_losses_gives_win_rate_zero(self, db):
+        trader = _make_trader(db)
+        for _ in range(3):
+            _make_settled_trade(db, trader, pnl=-2.0)
+        update_trader_stats_from_history(db, trader)
+        assert trader.win_rate == pytest.approx(0.0, abs=0.01)
+
+    def test_low_variance_pnl_gives_high_consistency(self, db):
+        trader = _make_trader(db)
+        for _ in range(5):
+            _make_settled_trade(db, trader, pnl=5.0)  # identical PnL → zero std dev
+        update_trader_stats_from_history(db, trader)
+        assert trader.consistency_score == pytest.approx(1.0, abs=0.01)
+
+    def test_high_variance_pnl_gives_low_consistency(self, db):
+        trader = _make_trader(db)
+        _make_settled_trade(db, trader, pnl=100.0)
+        _make_settled_trade(db, trader, pnl=-100.0)
+        update_trader_stats_from_history(db, trader)
+        # cv is high → consistency close to 0
+        assert trader.consistency_score < 0.5
+
+    def test_single_settled_trade_consistency_stays_zero(self, db):
+        trader = _make_trader(db)
+        _make_settled_trade(db, trader, pnl=3.0)
+        update_trader_stats_from_history(db, trader)
+        assert trader.total_trades == 1
+        assert trader.win_rate == pytest.approx(1.0, abs=0.01)
+        assert trader.consistency_score == 0.0  # can't compute stdev with 1 sample
+
+    def test_stopped_out_trades_are_included(self, db):
+        trader = _make_trader(db)
+        _make_settled_trade(db, trader, pnl=2.0, status="settled")
+        _make_settled_trade(db, trader, pnl=-1.0, status="stopped_out")
+        update_trader_stats_from_history(db, trader)
+        assert trader.total_trades == 2
+        assert trader.win_rate == pytest.approx(0.5, abs=0.01)
+
+    def test_pending_trades_not_counted(self, db):
+        trader = _make_trader(db)
+        _make_settled_trade(db, trader, pnl=5.0, status="settled")
+        _make_settled_trade(db, trader, pnl=None if False else 99.0, status="simulated")
+        # Only 1 settled trade counts
+        update_trader_stats_from_history(db, trader)
+        assert trader.total_trades == 1
+
+    def test_elephant_score_boosted_with_good_history(self, scraper):
+        """Positive win_rate above 0.5 should yield a higher score than without history."""
+        data = {"rank_pnl": 5, "rank_volume": 5, "rank_markets": 5, "markets_traded": 30}
+        base_score = scraper._compute_elephant_score(data)
+        boosted_score = scraper._compute_elephant_score(data, win_rate=0.80, consistency_score=0.7)
+        assert boosted_score > base_score
+
+    def test_elephant_score_unchanged_for_breakeven_win_rate(self, scraper):
+        """win_rate=0.5 at the edge → win_edge=0 but consistency_score>0 still applies."""
+        data = {"rank_pnl": 5}
+        score_no_history = scraper._compute_elephant_score(data)
+        score_with_history = scraper._compute_elephant_score(
+            data, win_rate=0.5, consistency_score=0.0
+        )
+        # win_rate=0.5 → win_edge=0; consistency=0 → quality=0 → no multiplier applied
+        # BUT the condition `win_rate > 0.0` triggers the block → raw * (1 + 0) = raw unchanged
+        assert score_with_history == pytest.approx(score_no_history, abs=0.01)
