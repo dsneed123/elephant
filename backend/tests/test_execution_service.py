@@ -214,6 +214,7 @@ class TestExecuteSignal:
             mock_settings.paper_balance_initial = 1000.0
             mock_settings.max_total_exposure_pct = 0.30
             mock_settings.max_daily_loss_pct = 0.10
+            mock_settings.max_per_trader_exposure_pct = 0.15
 
             _run(execution_service.execute_signal(signal.id))
 
@@ -239,6 +240,7 @@ class TestExecuteSignal:
             mock_settings.paper_balance_initial = 1000.0
             mock_settings.max_total_exposure_pct = 0.30
             mock_settings.max_daily_loss_pct = 0.10
+            mock_settings.max_per_trader_exposure_pct = 0.15
 
             _run(execution_service.execute_signal(signal.id))
 
@@ -445,6 +447,7 @@ class TestRiskLimits:
         mock_settings.paper_balance_initial = 1000.0
         mock_settings.max_total_exposure_pct = 0.30
         mock_settings.max_daily_loss_pct = 0.10
+        mock_settings.max_per_trader_exposure_pct = 0.15
 
     def test_max_total_exposure_skips_signal(self, db):
         """Signal is skipped when open trade costs breach max_total_exposure_pct."""
@@ -577,6 +580,165 @@ class TestRiskLimits:
             self._patch_settings(mock_settings)
             _run(execution_service.execute_signal(signal.id))
 
+        sim.assert_awaited_once()
+
+    def test_per_trader_exposure_breach_skips_signal(self, db):
+        """Signal is skipped when open costs for its trader breach max_per_trader_exposure_pct."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        db.add(PortfolioSnapshot(
+            balance=1000.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+        ))
+        # Two prior signals from the same trader, each with an open copied trade
+        # Total: $90 + $90 = $180 > 15% of $1000 ($150)
+        for _ in range(2):
+            prior_signal = TradeSignal(
+                trader_id=trader.id,
+                market_ticker="PRIOR-MARKET",
+                side="yes",
+                action="buy",
+                detected_price=50.0,
+                confidence=0.88,
+                status="copied",
+            )
+            db.add(prior_signal)
+            db.flush()
+            db.add(CopiedTrade(
+                signal_id=prior_signal.id,
+                market_ticker="PRIOR-MARKET",
+                side="yes",
+                action="buy",
+                contracts=100,
+                price=0.90,
+                cost=90.0,
+                kalshi_order_id=f"prior-order-{prior_signal.id}",
+                status="pending",
+                is_simulated=True,
+            ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        sim.assert_not_awaited()
+        db.refresh(signal)
+        assert signal.status == "skipped"
+
+    def test_per_trader_exposure_pass_executes_signal(self, db):
+        """Signal executes when per-trader open costs are below max_per_trader_exposure_pct."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        db.add(PortfolioSnapshot(
+            balance=1000.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+        ))
+        # One prior open trade for this trader: $50 < 15% of $1000 ($150)
+        prior_signal = TradeSignal(
+            trader_id=trader.id,
+            market_ticker="PRIOR-MARKET",
+            side="yes",
+            action="buy",
+            detected_price=50.0,
+            confidence=0.88,
+            status="copied",
+        )
+        db.add(prior_signal)
+        db.flush()
+        db.add(CopiedTrade(
+            signal_id=prior_signal.id,
+            market_ticker="PRIOR-MARKET",
+            side="yes",
+            action="buy",
+            contracts=100,
+            price=0.50,
+            cost=50.0,
+            kalshi_order_id="prior-order",
+            status="pending",
+            is_simulated=True,
+        ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        sim.assert_awaited_once()
+
+    def test_per_trader_exposure_only_counts_same_trader(self, db):
+        """Open costs from a different trader do not count toward per-trader limit."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        # A second trader with heavy open exposure
+        other_trader = TrackedTrader(
+            kalshi_username="other_whale",
+            elephant_score=85.0,
+            win_rate=0.70,
+            total_trades=30,
+        )
+        db.add(other_trader)
+        db.flush()
+
+        db.add(PortfolioSnapshot(
+            balance=1000.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+        ))
+        # Other trader has $200 open — would breach if counted for our trader
+        other_signal = TradeSignal(
+            trader_id=other_trader.id,
+            market_ticker="OTHER-MARKET",
+            side="yes",
+            action="buy",
+            detected_price=50.0,
+            confidence=0.88,
+            status="copied",
+        )
+        db.add(other_signal)
+        db.flush()
+        db.add(CopiedTrade(
+            signal_id=other_signal.id,
+            market_ticker="OTHER-MARKET",
+            side="yes",
+            action="buy",
+            contracts=200,
+            price=1.00,
+            cost=200.0,
+            kalshi_order_id="other-order",
+            status="pending",
+            is_simulated=True,
+        ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        # Our trader has $0 open exposure → should execute
         sim.assert_awaited_once()
 
 

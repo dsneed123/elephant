@@ -21,6 +21,7 @@ router = APIRouter()
 class AppSettings(BaseModel):
     max_exposure_pct: float
     max_daily_loss_pct: float
+    max_per_trader_exposure_pct: float
     stop_loss_pct: float
     min_confidence_threshold: float
     whale_order_threshold: float
@@ -31,6 +32,7 @@ class AppSettings(BaseModel):
 class SettingsPatch(BaseModel):
     max_exposure_pct: Optional[float] = None
     max_daily_loss_pct: Optional[float] = None
+    max_per_trader_exposure_pct: Optional[float] = None
     stop_loss_pct: Optional[float] = None
     min_confidence_threshold: Optional[float] = None
     whale_order_threshold: Optional[float] = None
@@ -38,7 +40,8 @@ class SettingsPatch(BaseModel):
     paper_balance: Optional[float] = None
 
     @field_validator(
-        "max_exposure_pct", "max_daily_loss_pct", "stop_loss_pct", "min_confidence_threshold"
+        "max_exposure_pct", "max_daily_loss_pct", "max_per_trader_exposure_pct",
+        "stop_loss_pct", "min_confidence_threshold"
     )
     @classmethod
     def validate_fraction(cls, v: Optional[float]) -> Optional[float]:
@@ -67,6 +70,7 @@ def _load() -> AppSettings:
     return AppSettings(
         max_exposure_pct=env_settings.max_total_exposure_pct,
         max_daily_loss_pct=env_settings.max_daily_loss_pct,
+        max_per_trader_exposure_pct=env_settings.max_per_trader_exposure_pct,
         stop_loss_pct=env_settings.stop_loss_pct,
         min_confidence_threshold=env_settings.min_signal_confidence,
         whale_order_threshold=env_settings.whale_order_threshold,

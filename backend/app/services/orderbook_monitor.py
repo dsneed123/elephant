@@ -50,7 +50,12 @@ def _make_auth_headers(private_key) -> dict[str, str]:
 
 
 def _get_tracked_market_tickers() -> list[str]:
-    """Query DB for all market tickers tracked by active traders."""
+    """Query DB for market tickers tracked by active traders.
+
+    If no traders have specific top_markets data, falls back to the most
+    active open markets from the Kalshi public API so the monitor always
+    has something to subscribe to.
+    """
     from app.db import SessionLocal
     from app.models import TrackedTrader
     db = SessionLocal()
@@ -69,9 +74,48 @@ def _get_tracked_market_tickers() -> list[str]:
                 tickers.update(markets)
             except (json.JSONDecodeError, TypeError):
                 continue
-        return list(tickers)
+
+        if tickers:
+            return list(tickers)
+
+        # Fallback: fetch the most active open markets from Kalshi API
+        if traders:
+            logger.info(
+                "No trader-specific markets found; fetching active markets from Kalshi API"
+            )
+            return _fetch_active_market_tickers()
+        return []
     finally:
         db.close()
+
+
+def _fetch_active_market_tickers(limit: int = 50) -> list[str]:
+    """Fetch tickers for the most active open markets from the Kalshi API."""
+    import httpx
+    url = "https://api.elections.kalshi.com/trade-api/v2/markets"
+    try:
+        resp = httpx.get(
+            url,
+            params={"status": "open", "limit": limit},
+            timeout=15.0,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        markets = resp.json().get("markets", [])
+        # Pick markets with actual volume/liquidity
+        active = [
+            m["ticker"]
+            for m in markets
+            if m.get("ticker") and float(m.get("volume_fp", "0") or "0") > 0
+        ]
+        if not active:
+            # If no volume data, just return all tickers
+            active = [m["ticker"] for m in markets if m.get("ticker")]
+        logger.info("Fetched %d active market tickers as fallback", len(active))
+        return active[:limit]
+    except Exception as exc:
+        logger.error("Failed to fetch active markets: %s", exc)
+        return []
 
 
 def _detect_whale(msg: dict) -> WhaleEvent | None:
