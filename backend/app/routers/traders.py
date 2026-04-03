@@ -1,9 +1,13 @@
 """Tracked traders endpoints."""
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+
 from app.db import get_db
 from app.models import TrackedTrader
+from app.services.leaderboard_scraper import scraper
 
 router = APIRouter()
 
@@ -36,3 +40,10 @@ def get_trader(username: str, db: Session = Depends(get_db)):
     if not trader:
         return {"error": "Trader not found"}
     return trader
+
+
+@router.post("/scrape")
+async def trigger_scrape(db: Session = Depends(get_db)):
+    """Manually trigger a Kalshi leaderboard scrape."""
+    count = await scraper.scrape(db)
+    return {"scraped": count, "timestamp": datetime.utcnow().isoformat()}

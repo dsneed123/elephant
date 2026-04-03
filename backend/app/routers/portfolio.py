@@ -1,10 +1,14 @@
 """Portfolio and copy-trading endpoints."""
 
+import logging
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import CopiedTrade, PortfolioSnapshot
+from app.services.kalshi_client import get_kalshi_client
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -18,7 +22,7 @@ def list_copied_trades(limit: int = 50, db: Session = Depends(get_db)):
 
 
 @router.get("/performance")
-def portfolio_performance(db: Session = Depends(get_db)):
+async def portfolio_performance(db: Session = Depends(get_db)):
     """Get portfolio performance summary."""
     latest = db.query(PortfolioSnapshot).order_by(
         PortfolioSnapshot.created_at.desc()
@@ -32,8 +36,14 @@ def portfolio_performance(db: Session = Depends(get_db)):
         ).all()
     )
 
+    try:
+        balance = await get_kalshi_client().get_portfolio_balance()
+    except Exception as exc:
+        logger.warning("Could not fetch Kalshi balance: %s", exc)
+        balance = latest.balance if latest else 0
+
     return {
-        "balance": latest.balance if latest else 0,
+        "balance": balance,
         "total_value": latest.total_value if latest else 0,
         "total_pnl": total_pnl,
         "total_trades": total_trades,
