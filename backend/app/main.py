@@ -10,11 +10,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import settings
+from app.config import settings as app_settings
 from app.db import SessionLocal
 from app.websocket_manager import get_manager
 from app.models import CopiedTrade, PortfolioSnapshot
-from app.routers import traders, markets, portfolio, signals, settings
+from app.routers import traders, markets, portfolio, signals
+from app.routers import settings as settings_router
 from app.services.kalshi_client import get_kalshi_client, is_circuit_open
 from app.services.leaderboard_scraper import run_scrape
 from app.services.orderbook_monitor import get_monitor, run_orderbook_monitor
@@ -67,7 +68,7 @@ async def _snapshot_portfolio_job() -> None:
     """APScheduler wrapper: capture a portfolio snapshot every 30 minutes."""
     db = SessionLocal()
     try:
-        if settings.dry_run:
+        if app_settings.dry_run:
             # Paper trading: compute paper balance from simulated trades only.
             all_simulated = (
                 db.query(CopiedTrade)
@@ -80,7 +81,7 @@ async def _snapshot_portfolio_job() -> None:
             total_pnl = sum(t.pnl for t in settled_trades)
             open_costs = sum(t.cost for t in open_trades)
             # Available cash = initial capital + settled PnL - cost locked in open trades
-            balance = settings.paper_balance_initial + total_pnl - open_costs
+            balance = app_settings.paper_balance_initial + total_pnl - open_costs
             positions_value = sum(t.contracts * t.price for t in open_trades)
         else:
             client = get_kalshi_client()
@@ -121,7 +122,7 @@ async def _snapshot_portfolio_job() -> None:
         db.commit()
         logger.info(
             "Portfolio snapshot (%s): balance=%.2f positions=%.2f total_pnl=%.2f win_rate=%.2f",
-            "paper" if settings.dry_run else "live",
+            "paper" if app_settings.dry_run else "live",
             balance,
             positions_value,
             total_pnl,
@@ -186,12 +187,12 @@ async def lifespan(app: FastAPI):
         "trade settlement every 15 minutes, "
         "portfolio snapshot every 30 minutes"
     )
-    if settings.dry_run:
+    if app_settings.dry_run:
         logger.warning(
             "DRY RUN mode enabled (paper_balance_initial=%.2f). "
             "Orders will be simulated — no real trades will be placed. "
             "Set DRY_RUN=false to enable live trading.",
-            settings.paper_balance_initial,
+            app_settings.paper_balance_initial,
         )
 
     # Start WebSocket order book monitor as a proper asyncio task
@@ -226,7 +227,7 @@ app.include_router(traders.router, prefix="/api/traders", tags=["traders"])
 app.include_router(markets.router, prefix="/api/markets", tags=["markets"])
 app.include_router(portfolio.router, prefix="/api/portfolio", tags=["portfolio"])
 app.include_router(signals.router, prefix="/api/signals", tags=["signals"])
-app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
+app.include_router(settings_router.router, prefix="/api/settings", tags=["settings"])
 
 
 @app.websocket("/ws")
