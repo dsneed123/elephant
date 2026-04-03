@@ -2,7 +2,9 @@
 
 import asyncio
 import base64
+import functools
 import logging
+import random
 import time
 from pathlib import Path
 
@@ -13,6 +15,77 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 1.0   # seconds
+_RETRY_MAX_DELAY = 30.0   # seconds
+
+
+def _with_retry(fn):
+    """Decorator: retry on 429, 5xx, and network timeouts with exponential backoff + jitter.
+
+    Rules:
+    - 429: respect Retry-After header if present, else backoff. Max 3 retries.
+    - 5xx: exponential backoff with jitter. Max 3 retries.
+    - httpx.TimeoutException: exponential backoff with jitter. Max 3 retries.
+    - Other 4xx: raise immediately (no retry).
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(self, *args, **kwargs):
+        for attempt in range(_RETRY_MAX_ATTEMPTS + 1):
+            try:
+                return await fn(self, *args, **kwargs)
+            except httpx.TimeoutException as exc:
+                if attempt == _RETRY_MAX_ATTEMPTS:
+                    raise
+                delay = _backoff_delay(attempt)
+                logger.warning(
+                    "%s timed out (attempt %d/%d), retrying in %.1fs",
+                    fn.__name__, attempt + 1, _RETRY_MAX_ATTEMPTS, delay,
+                )
+                await asyncio.sleep(delay)
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status == 429:
+                    if attempt == _RETRY_MAX_ATTEMPTS:
+                        raise
+                    delay = _retry_after_delay(exc.response, attempt)
+                    logger.warning(
+                        "%s rate-limited 429 (attempt %d/%d), retrying in %.1fs",
+                        fn.__name__, attempt + 1, _RETRY_MAX_ATTEMPTS, delay,
+                    )
+                    await asyncio.sleep(delay)
+                elif 500 <= status < 600:
+                    if attempt == _RETRY_MAX_ATTEMPTS:
+                        raise
+                    delay = _backoff_delay(attempt)
+                    logger.warning(
+                        "%s server error %d (attempt %d/%d), retrying in %.1fs",
+                        fn.__name__, status, attempt + 1, _RETRY_MAX_ATTEMPTS, delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+
+    return wrapper
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with full jitter: uniform(0, min(cap, base * 2^attempt))."""
+    cap = min(_RETRY_MAX_DELAY, _RETRY_BASE_DELAY * (2 ** attempt))
+    return random.uniform(0, cap)
+
+
+def _retry_after_delay(response: httpx.Response, attempt: int) -> float:
+    """Return delay from Retry-After header or fall back to exponential backoff."""
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    return _backoff_delay(attempt)
 
 
 class _TokenBucket:
@@ -126,11 +199,13 @@ class KalshiClient:
     # Public API methods                                                   #
     # ------------------------------------------------------------------ #
 
+    @_with_retry
     async def get_portfolio_balance(self) -> float:
         """Return the available balance in cents (as a float)."""
         data = await self._get("/portfolio/balance")
         return float(data.get("balance", 0))
 
+    @_with_retry
     async def place_order(
         self,
         ticker: str,
@@ -151,11 +226,13 @@ class KalshiClient:
         data = await self._post("/portfolio/orders", json=payload)
         return data.get("order", data)
 
+    @_with_retry
     async def get_order(self, order_id: str) -> dict:
         """Fetch a single order by ID."""
         data = await self._get(f"/portfolio/orders/{order_id}")
         return data.get("order", data)
 
+    @_with_retry
     async def cancel_order(self, order_id: str) -> dict:
         """Cancel an open order by ID."""
         data = await self._delete(f"/portfolio/orders/{order_id}")
