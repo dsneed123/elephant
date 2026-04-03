@@ -608,3 +608,195 @@ class TestSettleOpenTrades:
         db.refresh(ok_trade)
         assert failing_trade.status == "pending"  # left open
         assert ok_trade.status == "settled"
+
+
+# ---------------------------------------------------------------------------
+# poll_open_orders
+# ---------------------------------------------------------------------------
+
+
+class TestPollOpenOrders:
+    def test_resting_order_leaves_trade_pending(self, db):
+        """Kalshi status 'resting': trade remains pending, returns 0."""
+        from app.services import settlement_service
+
+        trade = _make_trade(db, contracts=10, price=0.50, status="pending")
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(return_value={"status": "resting"})
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 0
+        db.refresh(trade)
+        assert trade.status == "pending"
+
+    def test_filled_order_updates_status_to_filled(self, db):
+        """Kalshi status 'filled': trade status set to 'filled', returns 1."""
+        from app.services import settlement_service
+
+        trade = _make_trade(db, contracts=10, price=0.50, status="pending")
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(return_value={"status": "filled"})
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 1
+        db.refresh(trade)
+        assert trade.status == "filled"
+
+    def test_partially_filled_updates_contracts_cost_and_status(self, db):
+        """Kalshi status 'partially_filled': contracts, cost, and status updated."""
+        from app.services import settlement_service
+
+        trade = _make_trade(db, contracts=10, price=0.50, status="pending")
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(
+            return_value={"status": "partially_filled", "filled_count": 4}
+        )
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 1
+        db.refresh(trade)
+        assert trade.status == "partial"
+        assert trade.contracts == 4
+        assert trade.cost == pytest.approx(4 * 0.50)
+
+    def test_cancelled_order_updates_status_to_cancelled(self, db):
+        """Kalshi status 'cancelled': trade status set to 'cancelled', returns 1."""
+        from app.services import settlement_service
+
+        trade = _make_trade(db, contracts=10, price=0.50, status="pending")
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(return_value={"status": "cancelled"})
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 1
+        db.refresh(trade)
+        assert trade.status == "cancelled"
+
+    def test_api_error_skips_trade_and_returns_zero(self, db):
+        """get_order raises exception: trade left unchanged, returns 0."""
+        from app.services import settlement_service
+
+        trade = _make_trade(db, contracts=10, price=0.50, status="pending")
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(side_effect=Exception("connection error"))
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 0
+        db.refresh(trade)
+        assert trade.status == "pending"
+
+    def test_no_pending_trades_returns_zero(self, db):
+        """No pending trades: returns 0 without calling the Kalshi API."""
+        from app.services import settlement_service
+
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock()
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 0
+        mock_client.get_order.assert_not_awaited()
+
+    def test_non_pending_trades_are_excluded(self, db):
+        """Trades with status != 'pending' are not polled."""
+        from app.services import settlement_service
+
+        _make_trade(db, contracts=5, price=0.50, status="filled")
+        _make_trade(db, contracts=5, price=0.50, status="partial")
+        _make_trade(db, contracts=5, price=0.50, status="cancelled")
+        _make_trade(db, contracts=5, price=0.50, status="settled")
+
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock()
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 0
+        mock_client.get_order.assert_not_awaited()
+
+    def test_trade_without_order_id_is_excluded(self, db):
+        """Trade with kalshi_order_id=None is not polled."""
+        from app.services import settlement_service
+
+        trade = CopiedTrade(
+            signal_id=None,
+            market_ticker="TEST-MKTX",
+            side="yes",
+            action="buy",
+            contracts=5,
+            price=0.50,
+            cost=2.50,
+            kalshi_order_id=None,
+            status="pending",
+            is_simulated=False,
+        )
+        db.add(trade)
+        db.commit()
+
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock()
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 0
+        mock_client.get_order.assert_not_awaited()
+
+    def test_one_failure_does_not_block_other_trades(self, db):
+        """If one order fetch fails, remaining pending trades are still polled."""
+        from app.services import settlement_service
+
+        failing_trade = _make_trade(
+            db, contracts=5, price=0.50, status="pending", market_ticker="FAIL-MKT"
+        )
+        ok_trade = _make_trade(
+            db, contracts=3, price=0.50, status="pending", market_ticker="OK-MKT"
+        )
+
+        mock_client = MagicMock()
+
+        async def _get_order_side_effect(order_id):
+            if order_id == failing_trade.kalshi_order_id:
+                raise Exception("transient error")
+            return {"status": "filled"}
+
+        mock_client.get_order = AsyncMock(side_effect=_get_order_side_effect)
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 1
+        db.refresh(failing_trade)
+        db.refresh(ok_trade)
+        assert failing_trade.status == "pending"  # left unchanged
+        assert ok_trade.status == "filled"
+
+    def test_partially_filled_with_zero_filled_count_no_update(self, db):
+        """partially_filled with filled_count=0 does not update the trade."""
+        from app.services import settlement_service
+
+        trade = _make_trade(db, contracts=10, price=0.50, status="pending")
+        mock_client = MagicMock()
+        mock_client.get_order = AsyncMock(
+            return_value={"status": "partially_filled", "filled_count": 0}
+        )
+
+        with patch("app.services.kalshi_client.get_kalshi_client", return_value=mock_client):
+            count = _run(settlement_service.poll_open_orders(db))
+
+        assert count == 0
+        db.refresh(trade)
+        assert trade.status == "pending"
+        assert trade.contracts == 10
