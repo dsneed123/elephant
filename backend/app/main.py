@@ -16,7 +16,7 @@ from app.models import CopiedTrade, PortfolioSnapshot
 from app.routers import traders, markets, portfolio, signals
 from app.services.kalshi_client import get_kalshi_client
 from app.services.leaderboard_scraper import run_scrape
-from app.services.orderbook_monitor import run_orderbook_monitor
+from app.services.orderbook_monitor import get_monitor, run_orderbook_monitor
 from app.services.settlement_service import settle_open_trades
 from app.services.signal_generator import expire_stale_signals
 
@@ -208,4 +208,4 @@ app.include_router(signals.router, prefix="/api/signals", tags=["signals"])
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "elephant"}
+    return {"status": "ok", "service": "elephant", **get_monitor().health_check()}

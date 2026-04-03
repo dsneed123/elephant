@@ -3,7 +3,7 @@
 import asyncio
 import json
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -77,14 +77,14 @@ class TestComputeElephantScore:
         assert score == pytest.approx(100.0, abs=0.01)
 
     def test_recency_within_7_days(self, scraper):
-        last_active = datetime.utcnow() - timedelta(days=3)
+        last_active = datetime.now(timezone.utc) - timedelta(days=3)
         data = self._data(win_rate=1.0, consistency_score=1.0, market_diversity=20,
                           total_profit=10_000.0, last_active=last_active)
         score = scraper._compute_elephant_score(data)
         assert score == pytest.approx(100.0, abs=0.01)
 
     def test_recency_exactly_7_days(self, scraper):
-        last_active = datetime.utcnow() - timedelta(days=7)
+        last_active = datetime.now(timezone.utc) - timedelta(days=7)
         data = self._data(last_active=last_active)
         score_7 = scraper._compute_elephant_score(data)
         score_no_date = scraper._compute_elephant_score(self._data())
@@ -92,14 +92,14 @@ class TestComputeElephantScore:
         assert score_7 == pytest.approx(score_no_date, abs=0.1)
 
     def test_recency_at_90_days_is_zero(self, scraper):
-        last_active = datetime.utcnow() - timedelta(days=90)
+        last_active = datetime.now(timezone.utc) - timedelta(days=90)
         data = self._data(last_active=last_active)
         # recency=0, all other zeros → raw=0 → score=0
         score = scraper._compute_elephant_score(data)
         assert score == pytest.approx(0.0, abs=0.01)
 
     def test_recency_beyond_90_days_clamped(self, scraper):
-        last_active = datetime.utcnow() - timedelta(days=200)
+        last_active = datetime.now(timezone.utc) - timedelta(days=200)
         data = self._data(last_active=last_active)
         score = scraper._compute_elephant_score(data)
         assert score == pytest.approx(0.0, abs=0.01)
@@ -107,7 +107,7 @@ class TestComputeElephantScore:
     def test_recency_midpoint_linear(self, scraper):
         # At day 48.5 (midpoint of 7–90), recency ≈ 0.5
         days_mid = 7 + (90 - 7) / 2  # = 48.5
-        last_active = datetime.utcnow() - timedelta(days=days_mid)
+        last_active = datetime.now(timezone.utc) - timedelta(days=days_mid)
         data = self._data(last_active=last_active)
         score = scraper._compute_elephant_score(data)
         # Only recency contributes (others = 0), weight 10%

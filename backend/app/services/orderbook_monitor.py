@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import websockets
@@ -108,98 +109,147 @@ def _detect_whale(msg: dict) -> WhaleEvent | None:
     )
 
 
-async def _run_connection(tickers: list[str], private_key) -> None:
-    """Open a single WebSocket connection, subscribe, and process messages."""
-    headers = _make_auth_headers(private_key)
-    url = settings.kalshi_ws_url
+class OrderbookMonitor:
+    """Manages the Kalshi WebSocket connection with reconnection and health tracking."""
 
-    logger.info("Connecting to Kalshi WebSocket: %s (%d markets)", url, len(tickers))
-    async with websockets.connect(url, additional_headers=headers) as ws:
-        subscribe_msg = {
-            "id": 1,
-            "cmd": "subscribe",
-            "params": {
-                "channels": ["orderbook_delta"],
-                "market_tickers": tickers,
-            },
+    def __init__(self) -> None:
+        self._running: bool = False
+        self._connected: bool = False
+        self._subscribed_markets: set[str] = set()
+        self._last_message_at: datetime | None = None
+        self._attempt: int = 0
+
+    def health_check(self) -> dict:
+        """Return current connection health as a JSON-serialisable dict."""
+        return {
+            "connected": self._connected,
+            "subscribed_markets": len(self._subscribed_markets),
+            "last_message_at": (
+                self._last_message_at.isoformat() if self._last_message_at else None
+            ),
         }
-        await ws.send(json.dumps(subscribe_msg))
-        logger.info("Subscribed to orderbook_delta for %d markets", len(tickers))
 
-        async for raw in ws:
-            try:
-                envelope = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning("Received non-JSON WebSocket message; skipping")
-                continue
+    async def run(self) -> None:
+        """
+        Long-running coroutine that monitors Kalshi order books for whale activity.
 
-            if envelope.get("type") != "orderbook_delta":
-                continue
+        Connects to the Kalshi WebSocket API, subscribes to orderbook_delta channels
+        for all markets tracked by active traders, and calls process_whale_event()
+        when a whale-sized order is detected.  Auto-reconnects with exponential
+        backoff (min(2**attempt * 1.0, 60)s) on disconnect or error.
+        """
+        self._running = True
+        self._attempt = 0
 
-            msg = envelope.get("msg", {})
-            event = _detect_whale(msg)
-            if event is None:
-                continue
-
-            logger.info(
-                "Whale detected: %s %s %s $%.2f",
-                event.market_ticker,
-                event.side,
-                event.action,
-                event.order_size,
+        try:
+            private_key = _load_private_key()
+        except FileNotFoundError:
+            logger.error(
+                "Kalshi private key not found at %s — order book monitor disabled",
+                settings.kalshi_private_key_path,
             )
+            return
 
-            from app.db import SessionLocal
-            db = SessionLocal()
+        while self._running:
+            if self._attempt > 0:
+                delay = min(2 ** self._attempt * _BASE_BACKOFF, _MAX_BACKOFF)
+                logger.info(
+                    "Reconnect attempt %d; waiting %.0fs before reconnecting",
+                    self._attempt,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+            tickers = _get_tracked_market_tickers()
+            if not tickers:
+                logger.info("No tracked markets found; will retry on next attempt")
+                self._attempt += 1
+                continue
+
             try:
-                process_whale_event(event, db)
+                await self._run_connection(tickers, private_key)
+                logger.info("WebSocket disconnected cleanly")
             except Exception:
                 logger.exception(
-                    "Error processing whale event for %s", event.market_ticker
+                    "WebSocket connection error (attempt %d)", self._attempt
                 )
             finally:
-                db.close()
+                self._connected = False
+
+            self._attempt += 1
+
+    async def _run_connection(self, tickers: list[str], private_key) -> None:
+        """Open a single WebSocket connection, subscribe, and process messages."""
+        self._subscribed_markets = set(tickers)
+        headers = _make_auth_headers(private_key)
+        url = settings.kalshi_ws_url
+
+        logger.info("Connecting to Kalshi WebSocket: %s (%d markets)", url, len(tickers))
+        async with websockets.connect(url, additional_headers=headers) as ws:
+            subscribe_msg = {
+                "id": 1,
+                "cmd": "subscribe",
+                "params": {
+                    "channels": ["orderbook_delta"],
+                    "market_tickers": tickers,
+                },
+            }
+            await ws.send(json.dumps(subscribe_msg))
+            logger.info("Subscribed to orderbook_delta for %d markets", len(tickers))
+            self._connected = True
+            first_message = True
+
+            async for raw in ws:
+                try:
+                    envelope = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("Received non-JSON WebSocket message; skipping")
+                    continue
+
+                self._last_message_at = datetime.now(timezone.utc)
+
+                if first_message:
+                    first_message = False
+                    self._attempt = 0
+                    logger.info("First message received; reconnect attempt counter reset")
+
+                if envelope.get("type") != "orderbook_delta":
+                    continue
+
+                msg = envelope.get("msg", {})
+                event = _detect_whale(msg)
+                if event is None:
+                    continue
+
+                logger.info(
+                    "Whale detected: %s %s %s $%.2f",
+                    event.market_ticker,
+                    event.side,
+                    event.action,
+                    event.order_size,
+                )
+
+                from app.db import SessionLocal
+                db = SessionLocal()
+                try:
+                    process_whale_event(event, db)
+                except Exception:
+                    logger.exception(
+                        "Error processing whale event for %s", event.market_ticker
+                    )
+                finally:
+                    db.close()
+
+
+# Module-level singleton — imported by main.py for scheduling and health checks.
+_monitor = OrderbookMonitor()
+
+
+def get_monitor() -> OrderbookMonitor:
+    """Return the shared OrderbookMonitor instance."""
+    return _monitor
 
 
 async def run_orderbook_monitor() -> None:
-    """
-    Long-running coroutine that monitors Kalshi order books for whale activity.
-
-    Connects to the Kalshi WebSocket API, subscribes to orderbook_delta channels
-    for all markets tracked by active traders, and calls process_whale_event()
-    when a whale-sized order is detected.  Auto-reconnects with exponential
-    backoff on disconnect or error.
-    """
-    backoff = _BASE_BACKOFF
-
-    try:
-        private_key = _load_private_key()
-    except FileNotFoundError:
-        logger.error(
-            "Kalshi private key not found at %s — order book monitor disabled",
-            settings.kalshi_private_key_path,
-        )
-        return
-
-    while True:
-        tickers = _get_tracked_market_tickers()
-        if not tickers:
-            logger.info(
-                "No tracked markets found; retrying in %.0fs", backoff
-            )
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, _MAX_BACKOFF)
-            continue
-
-        try:
-            await _run_connection(tickers, private_key)
-            # Clean disconnect — reset backoff and reconnect promptly
-            logger.info("WebSocket disconnected cleanly; reconnecting in %.0fs", backoff)
-            backoff = _BASE_BACKOFF
-        except Exception:
-            logger.exception(
-                "WebSocket connection error; reconnecting in %.0fs", backoff
-            )
-
-        await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, _MAX_BACKOFF)
+    """Entry point called by APScheduler — delegates to the module singleton."""
+    await _monitor.run()

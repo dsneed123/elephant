@@ -1,0 +1,3 @@
+
+[notice] A new release of pip is available: 25.3 -> 26.0.1
+[notice] To update, run: /home/dsneedy/Desktop/TARS/repos/elephant/backend/.venv/bin/python3.14 -m pip install --upgrade pip

@@ -2,7 +2,7 @@
 
 import asyncio
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -509,7 +509,7 @@ class TestRiskLimits:
             status="settled",
             is_simulated=True,
             pnl=-110.0,
-            settled_at=datetime.utcnow(),
+            settled_at=datetime.now(timezone.utc),
         ))
         db.commit()
 
@@ -563,7 +563,7 @@ class TestRiskLimits:
             status="settled",
             is_simulated=True,
             pnl=-5.0,
-            settled_at=datetime.utcnow(),
+            settled_at=datetime.now(timezone.utc),
         ))
         db.commit()
 
