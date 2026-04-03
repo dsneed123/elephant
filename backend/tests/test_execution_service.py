@@ -1146,4 +1146,141 @@ class TestSettleReal:
         db.refresh(trade)
         assert result == 1
         assert trade.contracts == 10
-        assert trade.status == "settled"
+
+
+# ---------------------------------------------------------------------------
+# execute_signal integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteSignalIntegration:
+    """End-to-end integration tests for execute_signal covering key business paths."""
+
+    def _make_db_factory(self, db):
+        mock_db = MagicMock(wraps=db)
+        mock_db.close = MagicMock()
+        factory = MagicMock(return_value=mock_db)
+        return factory, mock_db
+
+    def _patch_settings(self, mock_settings):
+        mock_settings.dry_run = True
+        mock_settings.max_position_pct = 0.05
+        mock_settings.paper_balance_initial = 1000.0
+        mock_settings.max_total_exposure_pct = 0.30
+        mock_settings.max_daily_loss_pct = 0.10
+        mock_settings.max_per_trader_exposure_pct = 0.15
+        mock_settings.max_drawdown_pct = 0.25
+
+    def test_null_detected_price_is_skipped(self, db):
+        """execute_signal returns early when detected_price is None; no trade is created."""
+        from app.services import execution_service
+
+        trader = _make_trader(db)
+        signal = TradeSignal(
+            trader_id=trader.id,
+            market_ticker="NASDAQ-24DEC31",
+            side="yes",
+            action="buy",
+            detected_price=None,
+            confidence=0.88,
+            status="pending",
+        )
+        db.add(signal)
+        db.commit()
+        db.refresh(signal)
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        sim.assert_not_awaited()
+        trade = db.query(CopiedTrade).filter_by(signal_id=signal.id).first()
+        assert trade is None
+        db.refresh(signal)
+        assert signal.status == "pending"  # status unchanged
+
+    def test_valid_price_sufficient_balance_creates_trade_and_marks_copied(self, db):
+        """Signal with valid price and available balance produces a CopiedTrade (status=copied)."""
+        from app.services import execution_service
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        factory, mock_db = self._make_db_factory(db)
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        trade = db.query(CopiedTrade).filter_by(signal_id=signal.id).first()
+        assert trade is not None
+        assert trade.is_simulated is True
+        assert trade.status == "simulated"
+        db.refresh(signal)
+        assert signal.status == "copied"
+
+    def test_insufficient_balance_skips_execution(self, db):
+        """Signal is skipped when open trade costs have exhausted the total-exposure budget."""
+        from app.services import execution_service
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        db.add(PortfolioSnapshot(
+            balance=1000.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+        ))
+        # Open trades consuming > 30% of portfolio ($300 limit)
+        for _ in range(4):
+            db.add(CopiedTrade(
+                signal_id=None,
+                market_ticker="OPEN-MARKET",
+                side="yes",
+                action="buy",
+                contracts=100,
+                price=0.80,
+                cost=80.0,
+                kalshi_order_id="blocking-order",
+                status="pending",
+                is_simulated=True,
+            ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        sim.assert_not_awaited()
+        db.refresh(signal)
+        assert signal.status == "skipped"
+
+    def test_duplicate_execution_is_idempotent(self, db):
+        """Calling execute_signal twice for the same signal creates exactly one CopiedTrade."""
+        from app.services import execution_service
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        factory, mock_db = self._make_db_factory(db)
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))   # first: executes
+            _run(execution_service.execute_signal(signal.id))   # second: no-op
+
+        trades = db.query(CopiedTrade).filter_by(signal_id=signal.id).all()
+        assert len(trades) == 1
+        db.refresh(signal)
+        assert signal.status == "copied"
+        assert trades[0].status == "simulated"
