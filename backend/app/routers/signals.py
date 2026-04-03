@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import TradeSignal
+from app.services.signal_generator import WhaleEvent, process_whale_event
 
 router = APIRouter()
 
@@ -24,3 +25,10 @@ def pending_signals(db: Session = Depends(get_db)):
         TradeSignal.status == "pending"
     ).order_by(TradeSignal.confidence.desc()).all()
     return signals
+
+
+@router.post("/generate")
+def generate_signals(event: WhaleEvent, db: Session = Depends(get_db)):
+    """Manually trigger signal generation from a whale event (for testing)."""
+    signals = process_whale_event(event, db)
+    return {"generated": len(signals), "signal_ids": [s.id for s in signals]}

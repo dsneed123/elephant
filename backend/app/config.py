@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     min_win_rate: float = 0.65  # 65% minimum win rate
     min_trades: int = 20  # Minimum trades to qualify
 
+    # Signal generation settings
+    min_signal_confidence: float = 0.7  # Minimum confidence to emit a signal
+    min_elephant_score: float = 80.0  # Minimum elephant_score for signal candidates
+
     class Config:
         env_file = ".env"
 
