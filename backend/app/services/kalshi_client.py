@@ -238,6 +238,12 @@ class KalshiClient:
         data = await self._delete(f"/portfolio/orders/{order_id}")
         return data.get("order", data)
 
+    @_with_retry
+    async def get_market(self, ticker: str) -> dict:
+        """Fetch market data by ticker. Used by settlement to check resolution in dry-run mode."""
+        data = await self._get(f"/markets/{ticker}")
+        return data.get("market", data)
+
 
 # Module-level singleton
 kalshi_client = KalshiClient.__new__(KalshiClient)
