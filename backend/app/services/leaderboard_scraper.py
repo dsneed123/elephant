@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import math
+import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -17,7 +18,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
-from app.models import TrackedTrader
+from app.models import CopiedTrade, TradeSignal, TrackedTrader
 
 logger = logging.getLogger(__name__)
 
@@ -117,14 +118,19 @@ class LeaderboardScraper:
     # Scoring                                                              #
     # ------------------------------------------------------------------ #
 
-    def _compute_elephant_score(self, data: dict) -> float:
+    def _compute_elephant_score(
+        self, data: dict, win_rate: float = 0.0, consistency_score: float = 0.0
+    ) -> float:
         """Composite score (0-100) from available API data.
 
-        Weights:
+        Base weights (from leaderboard API):
           40%  PnL rank score      (top 1 = 1.0, rank 200 = 0.0)
           25%  Volume rank score   (same scale)
           20%  Market diversity    (log-scaled, 100 markets = 1.0)
           15%  Cross-metric bonus  (appears in multiple leaderboards)
+
+        When real trade history is available (win_rate or consistency_score > 0),
+        a quality multiplier of up to +25% is applied based on those values.
         """
         rank_pnl = data.get("rank_pnl", 999)
         rank_volume = data.get("rank_volume", 999)
@@ -147,7 +153,16 @@ class LeaderboardScraper:
             + 0.20 * diversity_score
             + 0.15 * cross_score
         )
-        return round(raw * 100.0, 2)
+
+        # Apply a quality multiplier when real trade history is available.
+        # win_edge: 0 at win_rate=0.5 (breakeven), 1.0 at win_rate=1.0
+        # Multiplier caps at 1.25 (+25% for a perfect win rate and consistency)
+        if win_rate > 0.0 or consistency_score > 0.0:
+            win_edge = max(0.0, (win_rate - 0.5) * 2.0)
+            quality = 0.60 * win_edge + 0.40 * consistency_score
+            raw = raw * (1.0 + 0.25 * quality)
+
+        return round(min(1.0, raw) * 100.0, 2)
 
     def _assign_tier(self, rank: int) -> str:
         if rank <= 10:
@@ -245,7 +260,11 @@ class LeaderboardScraper:
 
         count = 0
         for data in merged.values():
-            self._upsert_trader(db, data)
+            trader = self._upsert_trader(db, data)
+            update_trader_stats_from_history(db, trader)
+            trader.elephant_score = self._compute_elephant_score(
+                data, trader.win_rate, trader.consistency_score
+            )
             count += 1
 
         db.commit()
@@ -256,6 +275,53 @@ class LeaderboardScraper:
         _last_scrape_time = datetime.utcnow()
         _last_scrape_count = count
         return count
+
+
+def update_trader_stats_from_history(db: Session, trader: TrackedTrader) -> None:
+    """Compute win_rate and consistency_score from settled CopiedTrade history.
+
+    Queries CopiedTrade records whose TradeSignal.trader_id matches this trader,
+    then updates trader.win_rate, trader.consistency_score, and trader.total_trades
+    in place.  No commit — the caller is responsible for flushing/committing.
+
+    win_rate        = settled_wins / total_settled_trades
+    consistency_score = 1 / (1 + cv), where cv = stdev(pnl) / mean(|pnl|).
+                      Lower PnL variance → higher consistency (0–1).
+    """
+    if trader.id is None:
+        # New trader just added to the session but not yet flushed; no history exists.
+        return
+
+    settled_trades = (
+        db.query(CopiedTrade)
+        .join(TradeSignal, CopiedTrade.signal_id == TradeSignal.id)
+        .filter(
+            TradeSignal.trader_id == trader.id,
+            CopiedTrade.status.in_(["settled", "stopped_out"]),
+            CopiedTrade.pnl.isnot(None),
+        )
+        .all()
+    )
+
+    total_settled = len(settled_trades)
+    trader.total_trades = total_settled
+
+    if total_settled == 0:
+        return
+
+    pnl_values = [t.pnl for t in settled_trades]
+    settled_wins = sum(1 for p in pnl_values if p > 0)
+    trader.win_rate = settled_wins / total_settled
+
+    if total_settled >= 2:
+        std = statistics.stdev(pnl_values)
+        mean_abs = sum(abs(p) for p in pnl_values) / total_settled
+        if mean_abs == 0.0:
+            trader.consistency_score = 1.0
+        else:
+            cv = std / mean_abs
+            trader.consistency_score = round(1.0 / (1.0 + cv), 4)
+    # else: single trade — leave consistency_score at its current value (0.0 default)
 
 
 # Module-level singleton
