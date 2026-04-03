@@ -55,6 +55,16 @@ export interface PortfolioPerformance {
   win_rate: number
 }
 
+export interface AppSettings {
+  max_exposure_pct: number
+  max_daily_loss_pct: number
+  stop_loss_pct: number
+  min_confidence_threshold: number
+  whale_order_threshold: number
+  paper_trading_mode: boolean
+  paper_balance: number
+}
+
 export interface PortfolioSnapshot {
   id: number
   balance: number

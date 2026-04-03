@@ -5,6 +5,7 @@ const navItems = [
   { to: '/traders', label: 'Traders' },
   { to: '/signals', label: 'Signals' },
   { to: '/trades', label: 'Trades' },
+  { to: '/settings', label: 'Settings' },
 ]
 
 export default function Layout() {
