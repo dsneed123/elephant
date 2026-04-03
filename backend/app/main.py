@@ -11,7 +11,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import SessionLocal
+from app.models import CopiedTrade, PortfolioSnapshot
 from app.routers import traders, markets, portfolio, signals
+from app.services.kalshi_client import get_kalshi_client
 from app.services.leaderboard_scraper import run_scrape
 from app.services.orderbook_monitor import run_orderbook_monitor
 from app.services.settlement_service import settle_open_trades
@@ -47,6 +49,52 @@ async def _settle_trades_job() -> None:
         db.close()
 
 
+async def _snapshot_portfolio_job() -> None:
+    """APScheduler wrapper: capture a portfolio snapshot every 30 minutes."""
+    db = SessionLocal()
+    try:
+        client = get_kalshi_client()
+        balance = await client.get_portfolio_balance()
+
+        open_trades = (
+            db.query(CopiedTrade)
+            .filter(CopiedTrade.status.notin_(["settled", "cancelled"]))
+            .all()
+        )
+        positions_value = sum(t.contracts * t.price for t in open_trades)
+
+        settled_trades = (
+            db.query(CopiedTrade)
+            .filter(CopiedTrade.status == "settled", CopiedTrade.pnl.isnot(None))
+            .all()
+        )
+        total_pnl = sum(t.pnl for t in settled_trades)
+
+        profitable = sum(1 for t in settled_trades if t.pnl > 0)
+        win_rate = profitable / len(settled_trades) if settled_trades else 0.0
+
+        snapshot = PortfolioSnapshot(
+            balance=balance,
+            positions_value=positions_value,
+            total_value=balance + positions_value,
+            total_pnl=total_pnl,
+            win_rate=win_rate,
+        )
+        db.add(snapshot)
+        db.commit()
+        logger.info(
+            "Portfolio snapshot: balance=%.2f positions=%.2f total_pnl=%.2f win_rate=%.2f",
+            balance,
+            positions_value,
+            total_pnl,
+            win_rate,
+        )
+    except Exception:
+        logger.exception("_snapshot_portfolio_job failed")
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Apply any pending migrations on startup
@@ -77,6 +125,14 @@ async def lifespan(app: FastAPI):
         id="settle_open_trades",
         replace_existing=True,
     )
+    # Snapshot portfolio state every 30 minutes
+    scheduler.add_job(
+        _snapshot_portfolio_job,
+        trigger="interval",
+        minutes=30,
+        id="portfolio_snapshot",
+        replace_existing=True,
+    )
     # Start WebSocket order book monitor immediately as a background task
     scheduler.add_job(
         run_orderbook_monitor,
@@ -88,7 +144,7 @@ async def lifespan(app: FastAPI):
     logger.info(
         "APScheduler started — leaderboard scrape every 6 hours, "
         "signal expiry every 5 minutes, trade settlement every 15 minutes, "
-        "order book monitor running"
+        "portfolio snapshot every 30 minutes, order book monitor running"
     )
 
     yield
