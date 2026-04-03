@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { TradeSignal } from '../types'
+import { useWebSocket } from '../hooks/useWebSocket'
 
 type StatusFilter = 'all' | 'pending' | 'copied' | 'skipped' | 'expired' | 'dismissed'
 
@@ -37,11 +38,19 @@ export default function Signals() {
 
   useEffect(() => {
     load(filter)
-    // Poll every 15 seconds for new signals
+    // Poll every 15 seconds as a fallback for missed updates
     const interval = setInterval(() => load(filter), 15_000)
     return () => clearInterval(interval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter])
+
+  useWebSocket({
+    onSignalCreated: (signal) => {
+      if (filter === 'all' || filter === signal.status) {
+        setSignals((prev) => [signal, ...prev])
+      }
+    },
+  })
 
   const handleExecute = (id: number) => {
     setActionLoading((prev) => ({ ...prev, [id]: 'execute' }))

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { CopiedTrade } from '../types'
+import { useWebSocket } from '../hooks/useWebSocket'
 
 const STATUS_COLOR: Record<string, string> = {
   pending: 'bg-amber-500/20 text-amber-400',
@@ -9,6 +10,7 @@ const STATUS_COLOR: Record<string, string> = {
   cancelled: 'bg-zinc-700 text-zinc-500',
   settled: 'bg-emerald-500/20 text-emerald-400',
   simulated: 'bg-zinc-700 text-zinc-400',
+  stopped_out: 'bg-red-500/20 text-red-400',
 }
 
 export default function Trades() {
@@ -28,6 +30,18 @@ export default function Trades() {
         setLoading(false)
       })
   }, [])
+
+  useWebSocket({
+    onTradeUpdated: (trade) => {
+      setTrades((prev) => {
+        const idx = prev.findIndex((t) => t.id === trade.id)
+        if (idx === -1) return [trade, ...prev]
+        const next = [...prev]
+        next[idx] = trade
+        return next
+      })
+    },
+  })
 
   const totalPnl = trades.reduce((sum, t) => sum + (t.pnl ?? 0), 0)
   const settled = trades.filter((t) => t.status === 'settled')
