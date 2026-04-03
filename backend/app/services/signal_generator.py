@@ -1,6 +1,5 @@
 """Signal generation from order book whale events."""
 
-import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
@@ -129,19 +128,13 @@ def process_whale_event(event: WhaleEvent, db: Session) -> list[TradeSignal]:
 
     for sig in created:
         if sig.confidence >= settings.auto_execute_threshold:
-            try:
-                from app.services.execution_service import execute_signal
-                loop = asyncio.get_running_loop()
-                loop.create_task(execute_signal(sig.id))
-                logger.info(
-                    "Scheduled auto-execution for signal %d (confidence=%.3f)",
-                    sig.id,
-                    sig.confidence,
-                )
-            except RuntimeError:
-                logger.warning(
-                    "No running event loop; signal %d left pending for manual review",
-                    sig.id,
-                )
+            from app.main import scheduler
+            from app.services.execution_service import execute_signal
+            scheduler.add_job(execute_signal, trigger="date", args=[sig.id])
+            logger.info(
+                "Scheduled auto-execution for signal %d (confidence=%.3f)",
+                sig.id,
+                sig.confidence,
+            )
 
     return created

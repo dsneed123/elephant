@@ -3,7 +3,7 @@
 import logging
 import math
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.config import settings
 from app.models import CopiedTrade, PortfolioSnapshot, TradeSignal
@@ -69,7 +69,7 @@ def _check_risk_limits(db) -> str | None:
         )
 
     # Guard 2: daily realized loss
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     settled_today = (
         db.query(CopiedTrade)
         .filter(

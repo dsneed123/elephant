@@ -9,7 +9,7 @@ import json
 import logging
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -438,7 +438,7 @@ class LeaderboardScraper:
         if last_active is None:
             recency_score = 1.0  # appearing in current scrape means active now
         else:
-            days = (datetime.utcnow() - last_active).days
+            days = (datetime.now(timezone.utc) - last_active).days
             if days <= 7:
                 recency_score = 1.0
             elif days >= 90:
@@ -501,7 +501,7 @@ class LeaderboardScraper:
                 tier=tier,
                 top_markets=top_markets_json,
                 is_active=True,
-                last_seen=datetime.utcnow(),
+                last_seen=datetime.now(timezone.utc),
             )
             db.add(trader)
             logger.debug("New trader: %s  score=%.1f  tier=%s", username, elephant_score, tier)
@@ -518,7 +518,7 @@ class LeaderboardScraper:
             if top_markets_json is not None:
                 trader.top_markets = top_markets_json
             trader.is_active = True
-            trader.last_seen = datetime.utcnow()
+            trader.last_seen = datetime.now(timezone.utc)
             logger.debug("Updated trader: %s  score=%.1f  tier=%s", username, elephant_score, tier)
 
         return trader
