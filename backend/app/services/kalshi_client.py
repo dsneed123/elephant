@@ -341,6 +341,16 @@ class KalshiClient:
         data = await self._get(f"/markets/{ticker}")
         return data.get("market", data)
 
+    @_with_retry
+    async def list_markets(self, limit: int = 20, status: str = "open") -> dict:
+        """List active markets."""
+        return await self._get("/markets", params={"limit": limit, "status": status})
+
+    @_with_retry
+    async def get_orderbook(self, ticker: str) -> dict:
+        """Fetch order book for a market."""
+        return await self._get(f"/markets/{ticker}/orderbook")
+
 
 # Module-level singleton
 kalshi_client = KalshiClient.__new__(KalshiClient)
