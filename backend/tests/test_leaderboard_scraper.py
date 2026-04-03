@@ -1,16 +1,51 @@
-"""Tests for LeaderboardScraper._compute_elephant_score."""
+"""Tests for LeaderboardScraper scoring, normalization, and market enrichment."""
 
+import asyncio
+import json
 import math
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from app.db import Base
+from app.models import TrackedTrader
 from app.services.leaderboard_scraper import LeaderboardScraper
 
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def scraper():
     return LeaderboardScraper()
+
+
+@pytest.fixture
+def db():
+    """In-memory SQLite session for upsert tests."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    yield session
+    session.close()
+
+
+def _make_http_response(status_code: int, json_body: dict) -> MagicMock:
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.json.return_value = json_body
+    resp.raise_for_status = MagicMock()
+    if status_code >= 400:
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "error", request=MagicMock(), response=resp
+        )
+    return resp
 
 
 class TestComputeElephantScore:
@@ -116,3 +151,151 @@ class TestComputeElephantScore:
         data_normal = self._data(win_rate=1.0)
         score_normal = scraper._compute_elephant_score(data_normal)
         assert score_clamped == score_normal
+
+
+# ---------------------------------------------------------------------------
+# _normalize_entry — top_markets extraction
+# ---------------------------------------------------------------------------
+
+class TestNormalizeEntryTopMarkets:
+    def test_extracts_top_markets_list(self, scraper):
+        entry = {"username": "alice", "top_markets": ["MARKET-A", "MARKET-B"]}
+        result = scraper._normalize_entry(entry, 0)
+        assert result["top_markets"] == ["MARKET-A", "MARKET-B"]
+
+    def test_extracts_topMarkets_camelcase(self, scraper):
+        entry = {"username": "alice", "topMarkets": ["MARKET-X"]}
+        result = scraper._normalize_entry(entry, 0)
+        assert result["top_markets"] == ["MARKET-X"]
+
+    def test_no_market_data_gives_empty_list(self, scraper):
+        entry = {"username": "alice"}
+        result = scraper._normalize_entry(entry, 0)
+        assert result["top_markets"] == []
+
+    def test_non_list_market_data_gives_empty_list(self, scraper):
+        entry = {"username": "alice", "top_markets": "MARKET-A"}
+        result = scraper._normalize_entry(entry, 0)
+        assert result["top_markets"] == []
+
+
+# ---------------------------------------------------------------------------
+# _upsert_trader — top_markets persistence
+# ---------------------------------------------------------------------------
+
+class TestUpsertTraderTopMarkets:
+    def _base_data(self, **kwargs):
+        data = {
+            "username": "whale_trader",
+            "display_name": "Whale Trader",
+            "total_profit": 5000.0,
+            "win_rate": 0.75,
+            "total_trades": 50,
+            "avg_position_size": 100.0,
+            "market_diversity": 10,
+            "consistency_score": 0.8,
+            "top_markets": [],
+        }
+        data.update(kwargs)
+        return data
+
+    def test_new_trader_stores_top_markets(self, scraper, db):
+        data = self._base_data(top_markets=["NASDAQ-24DEC31", "FED-24DEC18"])
+        trader = scraper._upsert_trader(db, data, rank=1, total=10)
+        db.flush()
+        assert trader.top_markets == json.dumps(["NASDAQ-24DEC31", "FED-24DEC18"])
+
+    def test_new_trader_with_empty_markets_stores_null(self, scraper, db):
+        data = self._base_data(top_markets=[])
+        trader = scraper._upsert_trader(db, data, rank=1, total=10)
+        db.flush()
+        assert trader.top_markets is None
+
+    def test_existing_trader_markets_updated_when_new_data(self, scraper, db):
+        # Insert trader with initial markets
+        data = self._base_data(top_markets=["MARKET-A"])
+        scraper._upsert_trader(db, data, rank=1, total=10)
+        db.commit()
+
+        # Update with new markets
+        data["top_markets"] = ["MARKET-A", "MARKET-B"]
+        trader = scraper._upsert_trader(db, data, rank=1, total=10)
+        db.commit()
+        assert json.loads(trader.top_markets) == ["MARKET-A", "MARKET-B"]
+
+    def test_existing_trader_markets_preserved_when_no_new_data(self, scraper, db):
+        # Insert trader with markets
+        data = self._base_data(top_markets=["MARKET-A"])
+        scraper._upsert_trader(db, data, rank=1, total=10)
+        db.commit()
+
+        # Update with empty markets — existing data should be preserved
+        data["top_markets"] = []
+        trader = scraper._upsert_trader(db, data, rank=1, total=10)
+        db.commit()
+        assert json.loads(trader.top_markets) == ["MARKET-A"]
+
+
+# ---------------------------------------------------------------------------
+# _fetch_trader_markets — Kalshi public API
+# ---------------------------------------------------------------------------
+
+class TestFetchTraderMarkets:
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_returns_sorted_tickers_from_trades(self, scraper):
+        resp = _make_http_response(200, {
+            "trades": [
+                {"ticker": "NASDAQ-24DEC31"},
+                {"ticker": "FED-24DEC18"},
+                {"ticker": "NASDAQ-24DEC31"},  # duplicate — should be deduplicated
+            ]
+        })
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        assert result == ["FED-24DEC18", "NASDAQ-24DEC31"]
+
+    def test_returns_empty_on_401(self, scraper):
+        resp = _make_http_response(401, {})
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        assert result == []
+
+    def test_returns_empty_on_403(self, scraper):
+        resp = _make_http_response(403, {})
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        assert result == []
+
+    def test_returns_empty_on_404(self, scraper):
+        resp = _make_http_response(404, {})
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        assert result == []
+
+    def test_returns_empty_on_network_error(self, scraper):
+        client = AsyncMock()
+        client.get = AsyncMock(side_effect=httpx.RequestError("timeout"))
+        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        assert result == []
+
+    def test_handles_market_ticker_field_name(self, scraper):
+        resp = _make_http_response(200, {
+            "trades": [{"market_ticker": "BTCUSDT-24DEC31"}]
+        })
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        assert result == ["BTCUSDT-24DEC31"]
+
+    def test_empty_trades_list_returns_empty(self, scraper):
+        resp = _make_http_response(200, {"trades": []})
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+        result = self._run(scraper._fetch_trader_markets(client, "alice"))
+        assert result == []

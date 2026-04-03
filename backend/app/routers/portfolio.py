@@ -4,6 +4,7 @@ import logging
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+from app.config import settings
 from app.db import get_db
 from app.models import CopiedTrade, PortfolioSnapshot
 from app.services.kalshi_client import get_kalshi_client
@@ -28,23 +29,42 @@ async def portfolio_performance(db: Session = Depends(get_db)):
         PortfolioSnapshot.created_at.desc()
     ).first()
 
-    total_trades = db.query(CopiedTrade).count()
-    winning = db.query(CopiedTrade).filter(CopiedTrade.pnl > 0).count()
-    total_pnl = sum(
-        t.pnl for t in db.query(CopiedTrade).filter(
-            CopiedTrade.status == "settled"
-        ).all()
-    )
-
-    try:
-        balance = await get_kalshi_client().get_portfolio_balance()
-    except Exception as exc:
-        logger.warning("Could not fetch Kalshi balance: %s", exc)
-        balance = latest.balance if latest else 0
+    if settings.dry_run:
+        all_simulated = (
+            db.query(CopiedTrade)
+            .filter(CopiedTrade.is_simulated.is_(True))
+            .all()
+        )
+        total_trades = len(all_simulated)
+        settled = [t for t in all_simulated if t.status == "settled" and t.pnl is not None]
+        winning = sum(1 for t in settled if t.pnl > 0)
+        total_pnl = sum(t.pnl for t in settled)
+        open_costs = sum(
+            t.cost for t in all_simulated if t.status not in ("settled", "cancelled")
+        )
+        balance = settings.paper_balance_initial + total_pnl - open_costs
+    else:
+        total_trades = db.query(CopiedTrade).filter(CopiedTrade.is_simulated.is_(False)).count()
+        winning = db.query(CopiedTrade).filter(
+            CopiedTrade.is_simulated.is_(False), CopiedTrade.pnl > 0
+        ).count()
+        total_pnl = sum(
+            t.pnl for t in db.query(CopiedTrade).filter(
+                CopiedTrade.is_simulated.is_(False),
+                CopiedTrade.status == "settled",
+            ).all()
+            if t.pnl is not None
+        )
+        try:
+            balance = await get_kalshi_client().get_portfolio_balance()
+        except Exception as exc:
+            logger.warning("Could not fetch Kalshi balance: %s", exc)
+            balance = latest.balance if latest else 0
 
     return {
+        "mode": "paper" if settings.dry_run else "live",
         "balance": balance,
-        "total_value": latest.total_value if latest else 0,
+        "total_value": latest.total_value if latest else balance,
         "total_pnl": total_pnl,
         "total_trades": total_trades,
         "win_rate": winning / total_trades if total_trades > 0 else 0,

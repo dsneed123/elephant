@@ -10,6 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import CopiedTrade, PortfolioSnapshot
 from app.routers import traders, markets, portfolio, signals
@@ -53,22 +54,45 @@ async def _snapshot_portfolio_job() -> None:
     """APScheduler wrapper: capture a portfolio snapshot every 30 minutes."""
     db = SessionLocal()
     try:
-        client = get_kalshi_client()
-        balance = await client.get_portfolio_balance()
+        if settings.dry_run:
+            # Paper trading: compute paper balance from simulated trades only.
+            all_simulated = (
+                db.query(CopiedTrade)
+                .filter(CopiedTrade.is_simulated.is_(True))
+                .all()
+            )
+            open_trades = [t for t in all_simulated if t.status not in ("settled", "cancelled")]
+            settled_trades = [t for t in all_simulated if t.status == "settled" and t.pnl is not None]
 
-        open_trades = (
-            db.query(CopiedTrade)
-            .filter(CopiedTrade.status.notin_(["settled", "cancelled"]))
-            .all()
-        )
-        positions_value = sum(t.contracts * t.price for t in open_trades)
+            total_pnl = sum(t.pnl for t in settled_trades)
+            open_costs = sum(t.cost for t in open_trades)
+            # Available cash = initial capital + settled PnL - cost locked in open trades
+            balance = settings.paper_balance_initial + total_pnl - open_costs
+            positions_value = sum(t.contracts * t.price for t in open_trades)
+        else:
+            client = get_kalshi_client()
+            balance = await client.get_portfolio_balance()
 
-        settled_trades = (
-            db.query(CopiedTrade)
-            .filter(CopiedTrade.status == "settled", CopiedTrade.pnl.isnot(None))
-            .all()
-        )
-        total_pnl = sum(t.pnl for t in settled_trades)
+            open_trades = (
+                db.query(CopiedTrade)
+                .filter(
+                    CopiedTrade.is_simulated.is_(False),
+                    CopiedTrade.status.notin_(["settled", "cancelled"]),
+                )
+                .all()
+            )
+            positions_value = sum(t.contracts * t.price for t in open_trades)
+
+            settled_trades = (
+                db.query(CopiedTrade)
+                .filter(
+                    CopiedTrade.is_simulated.is_(False),
+                    CopiedTrade.status == "settled",
+                    CopiedTrade.pnl.isnot(None),
+                )
+                .all()
+            )
+            total_pnl = sum(t.pnl for t in settled_trades)
 
         profitable = sum(1 for t in settled_trades if t.pnl > 0)
         win_rate = profitable / len(settled_trades) if settled_trades else 0.0
@@ -83,7 +107,8 @@ async def _snapshot_portfolio_job() -> None:
         db.add(snapshot)
         db.commit()
         logger.info(
-            "Portfolio snapshot: balance=%.2f positions=%.2f total_pnl=%.2f win_rate=%.2f",
+            "Portfolio snapshot (%s): balance=%.2f positions=%.2f total_pnl=%.2f win_rate=%.2f",
+            "paper" if settings.dry_run else "live",
             balance,
             positions_value,
             total_pnl,
@@ -146,6 +171,13 @@ async def lifespan(app: FastAPI):
         "signal expiry every 5 minutes, trade settlement every 15 minutes, "
         "portfolio snapshot every 30 minutes, order book monitor running"
     )
+    if settings.dry_run:
+        logger.warning(
+            "DRY RUN mode enabled (paper_balance_initial=%.2f). "
+            "Orders will be simulated — no real trades will be placed. "
+            "Set DRY_RUN=false to enable live trading.",
+            settings.paper_balance_initial,
+        )
 
     yield
 

@@ -14,10 +14,13 @@ async def settle_open_trades(db: Session) -> int:
     """
     Settle open copied trades by fetching their order status from Kalshi.
 
-    Queries all CopiedTrades where pnl IS NULL, a kalshi_order_id exists, and
-    the trade is not already settled or cancelled. For each trade, fetches the
-    order from Kalshi; if the market has resolved (close_price present), computes
-    realized PnL and marks the trade settled.
+    For real trades (is_simulated=False): fetches the order from Kalshi; if the
+    market has resolved (close_price present), computes realized PnL and marks
+    the trade settled.
+
+    For simulated trades (is_simulated=True): fetches market data via get_market()
+    to check resolution. When the market result is available, computes PnL using
+    the same formula and marks the trade settled.
 
     Returns the number of trades settled in this run.
 
@@ -45,65 +48,116 @@ async def settle_open_trades(db: Session) -> int:
     settled_count = 0
 
     for trade in trades:
-        try:
-            order = await client.get_order(trade.kalshi_order_id)
-        except Exception:
-            logger.exception(
-                "Failed to fetch order %s for trade %d; will retry next run",
-                trade.kalshi_order_id,
-                trade.id,
-            )
-            continue
-
-        order_status = order.get("status", "")
-
-        if order_status == "cancelled":
-            trade.status = "cancelled"
-            db.commit()
-            logger.info(
-                "Trade %d cancelled (order %s)", trade.id, trade.kalshi_order_id
-            )
-            continue
-
-        # close_price is set by Kalshi once the market resolves.
-        # For binary YES/NO markets: 100 = YES wins, 0 = NO wins.
-        close_price = order.get("close_price")
-        if close_price is None:
-            # Market not yet resolved; revisit on the next scheduled run.
-            continue
-
-        # Prefer the actual fill price from the order; fall back to the price
-        # recorded at execution time (stored in dollars, so convert to cents).
-        if trade.side == "yes":
-            fill_price_cents = order.get("yes_price")
+        if trade.is_simulated:
+            settled_count += await _settle_simulated(db, trade, client)
         else:
-            fill_price_cents = order.get("no_price")
-
-        if fill_price_cents is None:
-            fill_price_cents = trade.price * 100  # trade.price is in dollars
-
-        filled_count = order.get("filled_count") or trade.contracts
-
-        if trade.side == "yes":
-            pnl = (close_price - fill_price_cents) * filled_count / 100
-        else:
-            pnl = ((100 - close_price) - fill_price_cents) * filled_count / 100
-
-        trade.pnl = pnl
-        trade.status = "settled"
-        trade.settled_at = datetime.utcnow()
-        db.commit()
-        settled_count += 1
-
-        logger.info(
-            "Settled trade %d: %s %s close_price=%d fill=%d¢ pnl=%.4f",
-            trade.id,
-            trade.market_ticker,
-            trade.side,
-            close_price,
-            fill_price_cents,
-            pnl,
-        )
+            settled_count += await _settle_real(db, trade, client)
 
     logger.info("settle_open_trades: settled %d / %d trade(s)", settled_count, len(trades))
     return settled_count
+
+
+async def _settle_simulated(db: Session, trade: CopiedTrade, client) -> int:
+    """Settle a simulated (dry-run) trade by checking market resolution via get_market()."""
+    try:
+        market = await client.get_market(trade.market_ticker)
+    except Exception:
+        logger.exception(
+            "Failed to fetch market %s for simulated trade %d; will retry next run",
+            trade.market_ticker,
+            trade.id,
+        )
+        return 0
+
+    result = market.get("result")
+    if result is None:
+        # Market not yet resolved; revisit on the next scheduled run.
+        return 0
+
+    # Convert market result to close_price used in the standard PnL formula.
+    close_price = 100 if result == "yes" else 0
+    fill_price_cents = trade.price * 100  # trade.price stored in dollars at execution time
+
+    if trade.side == "yes":
+        pnl = (close_price - fill_price_cents) * trade.contracts / 100
+    else:
+        pnl = ((100 - close_price) - fill_price_cents) * trade.contracts / 100
+
+    trade.pnl = pnl
+    trade.status = "settled"
+    trade.settled_at = datetime.utcnow()
+    db.commit()
+
+    logger.info(
+        "[DRY RUN] Settled simulated trade %d: %s %s result=%s fill=%d¢ pnl=%.4f",
+        trade.id,
+        trade.market_ticker,
+        trade.side,
+        result,
+        int(fill_price_cents),
+        pnl,
+    )
+    return 1
+
+
+async def _settle_real(db: Session, trade: CopiedTrade, client) -> int:
+    """Settle a live trade by fetching its order status from Kalshi."""
+    try:
+        order = await client.get_order(trade.kalshi_order_id)
+    except Exception:
+        logger.exception(
+            "Failed to fetch order %s for trade %d; will retry next run",
+            trade.kalshi_order_id,
+            trade.id,
+        )
+        return 0
+
+    order_status = order.get("status", "")
+
+    if order_status == "cancelled":
+        trade.status = "cancelled"
+        db.commit()
+        logger.info(
+            "Trade %d cancelled (order %s)", trade.id, trade.kalshi_order_id
+        )
+        return 0
+
+    # close_price is set by Kalshi once the market resolves.
+    # For binary YES/NO markets: 100 = YES wins, 0 = NO wins.
+    close_price = order.get("close_price")
+    if close_price is None:
+        # Market not yet resolved; revisit on the next scheduled run.
+        return 0
+
+    # Prefer the actual fill price from the order; fall back to the price
+    # recorded at execution time (stored in dollars, so convert to cents).
+    if trade.side == "yes":
+        fill_price_cents = order.get("yes_price")
+    else:
+        fill_price_cents = order.get("no_price")
+
+    if fill_price_cents is None:
+        fill_price_cents = trade.price * 100  # trade.price is in dollars
+
+    filled_count = order.get("filled_count") or trade.contracts
+
+    if trade.side == "yes":
+        pnl = (close_price - fill_price_cents) * filled_count / 100
+    else:
+        pnl = ((100 - close_price) - fill_price_cents) * filled_count / 100
+
+    trade.pnl = pnl
+    trade.status = "settled"
+    trade.settled_at = datetime.utcnow()
+    db.commit()
+
+    logger.info(
+        "Settled trade %d: %s %s close_price=%d fill=%d¢ pnl=%.4f",
+        trade.id,
+        trade.market_ticker,
+        trade.side,
+        close_price,
+        fill_price_cents,
+        pnl,
+    )
+    return 1

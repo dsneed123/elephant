@@ -29,14 +29,20 @@ def _compute_confidence(elephant_score: float, order_size: float) -> float:
 
 
 def _trader_tracks_market(trader: TrackedTrader, ticker: str) -> bool:
-    """Return True if the trader's top_markets JSON list includes ticker."""
+    """Return True if the trader's top_markets JSON list includes ticker.
+
+    A None or empty top_markets means the trader has no market filter yet,
+    so they are treated as tracking all markets.
+    """
     if not trader.top_markets:
-        return False
+        return True  # No market data populated — include for all markets
     try:
         markets = json.loads(trader.top_markets)
+        if not markets:
+            return True  # Empty list — treat as tracking all markets
         return ticker in markets
     except (json.JSONDecodeError, TypeError):
-        return False
+        return True  # Malformed JSON — don't exclude trader
 
 
 def expire_stale_signals(db: Session) -> int:

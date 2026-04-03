@@ -62,7 +62,8 @@ class CopiedTrade(Base):
     price = Column(Float, nullable=False)
     cost = Column(Float, nullable=False)
     kalshi_order_id = Column(String)
-    status = Column(String, default="pending")  # pending, filled, partial, cancelled, settled
+    status = Column(String, default="pending")  # pending, filled, partial, cancelled, settled, simulated
+    is_simulated = Column(Boolean, nullable=False, default=False, server_default="0")
     pnl = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     settled_at = Column(DateTime, nullable=True)

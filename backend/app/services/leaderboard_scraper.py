@@ -22,6 +22,7 @@ from app.models import TrackedTrader
 logger = logging.getLogger(__name__)
 
 LEADERBOARD_URL = "https://kalshi.com/social/leaderboard"
+KALSHI_TRADES_URL = "https://api.kalshi.com/trade-api/v2/portfolio/trades"
 SCRAPE_MIN_INTERVAL_HOURS = 1  # Never scrape more than once per hour
 
 # In-process rate-limit cache
@@ -326,6 +327,17 @@ class LeaderboardScraper:
             or entry.get("consistency")
         )
 
+        top_markets_raw = (
+            entry.get("top_markets")
+            or entry.get("topMarkets")
+            or entry.get("top_market_tickers")
+            or []
+        )
+        if isinstance(top_markets_raw, list):
+            top_markets = [str(m).strip() for m in top_markets_raw if m]
+        else:
+            top_markets = []
+
         return {
             "username": str(username).lower().strip(),
             "display_name": str(display_name).strip(),
@@ -335,6 +347,7 @@ class LeaderboardScraper:
             "avg_position_size": avg_pos,
             "market_diversity": diversity,
             "consistency_score": consistency,
+            "top_markets": top_markets,
             "rank": index + 1,
         }
 
@@ -346,6 +359,57 @@ class LeaderboardScraper:
         if soup.find_all("a", href=re.compile(rf"[?&]page={current_page + 1}")):
             return True
         return False
+
+    # ------------------------------------------------------------------ #
+    # Market enrichment via Kalshi public API                             #
+    # ------------------------------------------------------------------ #
+
+    async def _fetch_trader_markets(
+        self, client: httpx.AsyncClient, username: str
+    ) -> list[str]:
+        """Fetch market tickers from a trader's recent public trades.
+
+        Returns an empty list if the endpoint is inaccessible or returns nothing.
+        """
+        try:
+            resp = await client.get(
+                KALSHI_TRADES_URL,
+                params={"username": username, "limit": 100},
+            )
+            if resp.status_code in (401, 403, 404):
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+            trades = data.get("trades", [])
+            seen: set[str] = set()
+            for trade in trades:
+                ticker = trade.get("ticker") or trade.get("market_ticker") or ""
+                if ticker:
+                    seen.add(ticker)
+            return sorted(seen)
+        except (httpx.RequestError, httpx.HTTPStatusError):
+            return []
+
+    async def _enrich_markets_from_api(self, traders: list[dict]) -> None:
+        """Populate top_markets for traders whose leaderboard entry lacked market data.
+
+        Makes a best-effort call to the Kalshi public trades API for each trader
+        with an empty top_markets list. Skips silently if the API is not accessible.
+        """
+        to_enrich = [d for d in traders if not d.get("top_markets")]
+        if not to_enrich:
+            return
+
+        async with httpx.AsyncClient(
+            headers=self.HEADERS,
+            follow_redirects=True,
+            timeout=10.0,
+        ) as client:
+            for data in to_enrich:
+                markets = await self._fetch_trader_markets(client, data["username"])
+                if markets:
+                    data["top_markets"] = markets
+                await asyncio.sleep(0.1)  # polite delay between requests
 
     # ------------------------------------------------------------------ #
     # Scoring & tiering                                                    #
@@ -420,6 +484,9 @@ class LeaderboardScraper:
         elephant_score = self._compute_elephant_score(data)
         tier = self._assign_tier(rank, total)
 
+        top_markets_list = data.get("top_markets", [])
+        top_markets_json = json.dumps(top_markets_list) if top_markets_list else None
+
         if trader is None:
             trader = TrackedTrader(
                 kalshi_username=username,
@@ -432,6 +499,7 @@ class LeaderboardScraper:
                 consistency_score=data.get("consistency_score", 0.0),
                 elephant_score=elephant_score,
                 tier=tier,
+                top_markets=top_markets_json,
                 is_active=True,
                 last_seen=datetime.utcnow(),
             )
@@ -447,6 +515,8 @@ class LeaderboardScraper:
             trader.consistency_score = data.get("consistency_score", trader.consistency_score)
             trader.elephant_score = elephant_score
             trader.tier = tier
+            if top_markets_json is not None:
+                trader.top_markets = top_markets_json
             trader.is_active = True
             trader.last_seen = datetime.utcnow()
             logger.debug("Updated trader: %s  score=%.1f  tier=%s", username, elephant_score, tier)
@@ -493,6 +563,8 @@ class LeaderboardScraper:
             _last_scrape_time = datetime.utcnow()
             _last_scrape_count = 0
             return 0
+
+        await self._enrich_markets_from_api(raw_traders)
 
         count = 0
         for rank, data in enumerate(raw_traders, start=1):
