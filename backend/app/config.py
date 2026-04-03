@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     signal_ttl_minutes: int = 30  # Pending signals older than this are expired
     auto_execute_threshold: float = 0.85  # Confidence threshold for automatic trade execution
 
+    # Portfolio risk limits
+    max_daily_loss_pct: float = 0.10  # Abort if today's realized loss exceeds 10% of portfolio
+    max_total_exposure_pct: float = 0.30  # Abort if open trade costs exceed 30% of portfolio
+
     # Paper trading / dry-run settings
     dry_run: bool = True  # When True, simulate orders instead of calling Kalshi API
     paper_balance_initial: float = 1000.0  # Starting paper balance in dollars for dry-run mode
