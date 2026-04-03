@@ -20,7 +20,7 @@ from app.services.kalshi_client import get_kalshi_client, is_circuit_open
 from app.services.leaderboard_scraper import run_scrape
 from app.services.orderbook_monitor import get_monitor, run_orderbook_monitor
 from app.services.execution_service import check_stop_losses
-from app.services.settlement_service import settle_open_trades
+from app.services.settlement_service import settle_open_trades, poll_open_orders
 from app.services.signal_generator import expire_stale_signals
 
 _ALEMBIC_INI = os.path.join(os.path.dirname(__file__), "..", "alembic.ini")
@@ -49,6 +49,17 @@ async def _settle_trades_job() -> None:
     db = SessionLocal()
     try:
         await settle_open_trades(db)
+    finally:
+        db.close()
+
+
+async def _poll_open_orders_job() -> None:
+    """APScheduler wrapper: open a DB session, poll pending order fill status, close."""
+    db = SessionLocal()
+    try:
+        await poll_open_orders(db)
+    except Exception:
+        logger.exception("_poll_open_orders_job failed")
     finally:
         db.close()
 
@@ -148,6 +159,14 @@ async def lifespan(app: FastAPI):
         id="leaderboard_scrape",
         replace_existing=True,
     )
+    # Poll pending order fill status every 2 minutes
+    scheduler.add_job(
+        _poll_open_orders_job,
+        trigger="interval",
+        minutes=2,
+        id="poll_open_orders",
+        replace_existing=True,
+    )
     # Expire stale pending signals every 5 minutes
     scheduler.add_job(
         _expire_signals_job,
@@ -183,8 +202,8 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info(
         "APScheduler started — leaderboard scrape every 6 hours, "
-        "signal expiry every 5 minutes, stop-loss check every 5 minutes, "
-        "trade settlement every 15 minutes, "
+        "order fill poll every 2 minutes, signal expiry every 5 minutes, "
+        "stop-loss check every 5 minutes, trade settlement every 15 minutes, "
         "portfolio snapshot every 30 minutes"
     )
     if app_settings.dry_run:
