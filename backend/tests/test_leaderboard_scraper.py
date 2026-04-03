@@ -1,6 +1,7 @@
 """Tests for LeaderboardScraper: scoring, merging, persistence, and pipeline."""
 
 import asyncio
+import json
 import math
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -501,3 +502,137 @@ class TestUpdateTraderStatsFromHistory:
         # win_rate=0.5 → win_edge=0; consistency=0 → quality=0 → no multiplier applied
         # BUT the condition `win_rate > 0.0` triggers the block → raw * (1 + 0) = raw unchanged
         assert score_with_history == pytest.approx(score_no_history, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# _fetch_top_markets_for_trader and _enrich_with_top_markets
+# ---------------------------------------------------------------------------
+
+class TestFetchTopMarketsForTrader:
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _make_trades_response(self, tickers: list[str]) -> MagicMock:
+        trades = [{"ticker": t} for t in tickers]
+        return _make_http_response(200, {"trades": trades})
+
+    def test_returns_top_10_by_frequency(self, scraper):
+        # 12 different tickers; first 10 by count should be returned
+        tickers = ["MKT-A"] * 5 + ["MKT-B"] * 4 + ["MKT-C"] * 3 + ["MKT-D"] * 2 + \
+                  ["MKT-E", "MKT-F", "MKT-G", "MKT-H", "MKT-I", "MKT-J", "MKT-K", "MKT-L"]
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=self._make_trades_response(tickers))
+        result = self._run(scraper._fetch_top_markets_for_trader(client, "sometrader"))
+        parsed = json.loads(result)
+        assert len(parsed) <= 10
+        # MKT-A and MKT-B must be in the top results
+        assert "MKT-A" in parsed
+        assert "MKT-B" in parsed
+
+    def test_returns_empty_list_when_no_trades(self, scraper):
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_make_http_response(200, {"trades": []}))
+        result = self._run(scraper._fetch_top_markets_for_trader(client, "sometrader"))
+        assert json.loads(result) == []
+
+    def test_falls_back_on_403(self, scraper):
+        fallback_resp = _make_http_response(200, {
+            "markets": [
+                {"ticker": "OPEN-MKT-1"},
+                {"ticker": "OPEN-MKT-2"},
+            ]
+        })
+
+        async def fake_get(url, params=None):
+            if "portfolio/trades" in url:
+                resp = MagicMock(spec=httpx.Response)
+                resp.status_code = 403
+                return resp
+            return fallback_resp
+
+        client = AsyncMock()
+        client.get = AsyncMock(side_effect=fake_get)
+        result = self._run(scraper._fetch_top_markets_for_trader(client, "privatetrader"))
+        parsed = json.loads(result)
+        assert "OPEN-MKT-1" in parsed
+        assert "OPEN-MKT-2" in parsed
+
+    def test_returns_empty_list_on_network_error(self, scraper):
+        client = AsyncMock()
+        client.get = AsyncMock(side_effect=httpx.RequestError("timeout"))
+        result = self._run(scraper._fetch_top_markets_for_trader(client, "sometrader"))
+        assert json.loads(result) == []
+
+    def test_handles_market_ticker_field_name(self, scraper):
+        """Trades using 'market_ticker' instead of 'ticker' are counted correctly."""
+        trades_resp = _make_http_response(200, {
+            "trades": [
+                {"market_ticker": "ALT-MKT-1"},
+                {"market_ticker": "ALT-MKT-1"},
+                {"market_ticker": "ALT-MKT-2"},
+            ]
+        })
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=trades_resp)
+        result = self._run(scraper._fetch_top_markets_for_trader(client, "sometrader"))
+        parsed = json.loads(result)
+        assert "ALT-MKT-1" in parsed
+        assert "ALT-MKT-2" in parsed
+
+
+class TestEnrichWithTopMarkets:
+    def test_updates_top_markets_on_upserted_traders(self, scraper, db):
+        # Pre-create a trader in the DB
+        trader = TrackedTrader(
+            kalshi_username="whale_one",
+            display_name="whale_one",
+            win_rate=0.0,
+            consistency_score=0.0,
+            total_trades=0,
+            elephant_score=60.0,
+            tier="ranked",
+            is_active=True,
+        )
+        db.add(trader)
+        db.flush()
+
+        merged = {
+            "whale_one": {
+                "nickname": "whale_one",
+                "rank_pnl": 3,
+            }
+        }
+
+        async def fake_fetch(client, username):
+            return json.dumps(["MKT-X", "MKT-Y"])
+
+        with patch.object(scraper, "_fetch_top_markets_for_trader", side_effect=fake_fetch), \
+             patch("app.services.leaderboard_scraper.httpx.AsyncClient") as mock_client_cls, \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            asyncio.run(scraper._enrich_with_top_markets(db, merged))
+
+        db.flush()
+        updated = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "whale_one"
+        ).first()
+        assert updated.top_markets is not None
+        assert json.loads(updated.top_markets) == ["MKT-X", "MKT-Y"]
+
+    def test_skips_unknown_traders(self, scraper, db):
+        """Traders in merged but not in the DB are silently skipped."""
+        merged = {"ghost_trader": {"nickname": "ghost_trader"}}
+
+        with patch.object(scraper, "_fetch_top_markets_for_trader", new=AsyncMock()) as mock_fetch, \
+             patch("app.services.leaderboard_scraper.httpx.AsyncClient") as mock_client_cls, \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            asyncio.run(scraper._enrich_with_top_markets(db, merged))
+
+        mock_fetch.assert_not_called()

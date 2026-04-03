@@ -23,6 +23,7 @@ from app.models import CopiedTrade, TradeSignal, TrackedTrader
 logger = logging.getLogger(__name__)
 
 LEADERBOARD_API = "https://api.elections.kalshi.com/v1/social/leaderboard"
+KALSHI_TRADE_API = "https://trading-api.kalshi.com/trade-api/v2"
 SCRAPE_MIN_INTERVAL_HOURS = 1
 
 # Metrics and time periods to fetch
@@ -229,6 +230,72 @@ class LeaderboardScraper:
         return trader
 
     # ------------------------------------------------------------------ #
+    # Top-markets enrichment                                              #
+    # ------------------------------------------------------------------ #
+
+    async def _fallback_top_markets(self, client: httpx.AsyncClient) -> str:
+        """Fallback when trade history is private: return tickers from open markets."""
+        url = f"{KALSHI_TRADE_API}/markets"
+        try:
+            resp = await client.get(url, params={"status": "open", "limit": 10})
+            resp.raise_for_status()
+            data = resp.json()
+            tickers = [
+                m.get("ticker", "")
+                for m in data.get("markets", [])
+                if m.get("ticker")
+            ][:10]
+            return json.dumps(tickers)
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.warning("Fallback markets fetch failed: %s", exc)
+            return json.dumps([])
+
+    async def _fetch_top_markets_for_trader(
+        self, client: httpx.AsyncClient, username: str
+    ) -> str:
+        """Fetch a trader's most-traded market tickers; returns a JSON list of up to 10.
+
+        Tries GET /trade-api/v2/portfolio/trades?user_id={username}.
+        Falls back to open markets if the endpoint returns 403 (private profile).
+        """
+        url = f"{KALSHI_TRADE_API}/portfolio/trades"
+        try:
+            resp = await client.get(url, params={"user_id": username, "limit": 100})
+            if resp.status_code == 403:
+                logger.debug("Trade history private for %s; using fallback markets", username)
+                return await self._fallback_top_markets(client)
+            resp.raise_for_status()
+            trades = resp.json().get("trades", [])
+            ticker_counts: dict[str, int] = {}
+            for trade in trades:
+                ticker = trade.get("ticker") or trade.get("market_ticker", "")
+                if ticker:
+                    ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
+            top_tickers = sorted(ticker_counts, key=lambda t: ticker_counts[t], reverse=True)[:10]
+            logger.debug("Top markets for %s: %s", username, top_tickers)
+            return json.dumps(top_tickers)
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.warning("Could not fetch trade history for %s: %s", username, exc)
+            return json.dumps([])
+
+    async def _enrich_with_top_markets(
+        self, db: Session, merged: dict[str, dict]
+    ) -> None:
+        """Populate top_markets for every upserted trader from their public trade history."""
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            for nick in merged:
+                username = nick.lower()
+                trader = db.query(TrackedTrader).filter(
+                    TrackedTrader.kalshi_username == username
+                ).first()
+                if trader is None:
+                    continue
+                trader.top_markets = await self._fetch_top_markets_for_trader(
+                    client, username
+                )
+                await asyncio.sleep(0.3)  # polite delay
+
+    # ------------------------------------------------------------------ #
     # Public entry point                                                   #
     # ------------------------------------------------------------------ #
 
@@ -267,6 +334,8 @@ class LeaderboardScraper:
             )
             count += 1
 
+        db.flush()
+        await self._enrich_with_top_markets(db, merged)
         db.commit()
 
         elapsed_s = (datetime.utcnow() - started_at).total_seconds()
