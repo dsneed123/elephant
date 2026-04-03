@@ -104,6 +104,7 @@ def _detect_whale(msg: dict) -> WhaleEvent | None:
         side=side,
         action="buy",
         order_size=order_size_usd,
+        price=price,
     )
 
 
