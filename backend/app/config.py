@@ -1,5 +1,7 @@
 """App configuration via environment variables."""
 
+from typing import Optional
+
 from pydantic_settings import BaseSettings
 
 
@@ -37,6 +39,9 @@ class Settings(BaseSettings):
     # Webhook notifications
     webhook_url: str = ""  # Discord-compatible webhook URL; empty disables notifications
     webhook_enabled: bool = False  # Set True to enable webhook notifications
+
+    # API key authentication (ELEPHANT_API_KEY); None disables auth (dev mode)
+    api_key: Optional[str] = None
 
     class Config:
         env_file = ".env"
