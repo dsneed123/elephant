@@ -45,6 +45,7 @@ class TestLoad:
         data = {
             "max_exposure_pct": 0.15,
             "max_daily_loss_pct": 0.05,
+            "max_per_trader_exposure_pct": 0.10,
             "stop_loss_pct": 0.10,
             "min_confidence_threshold": 0.80,
             "whale_order_threshold": 500.0,
@@ -77,6 +78,7 @@ class TestGetSettings:
         expected_keys = {
             "max_exposure_pct",
             "max_daily_loss_pct",
+            "max_per_trader_exposure_pct",
             "stop_loss_pct",
             "min_confidence_threshold",
             "whale_order_threshold",

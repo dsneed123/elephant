@@ -53,14 +53,15 @@ def _kelly_position_pct(win_rate: float, price: float, max_pct: float) -> float 
     return min(half_kelly, max_pct)
 
 
-def _check_risk_limits(db) -> str | None:
+def _check_risk_limits(db, signal: TradeSignal) -> str | None:
     """
     Check portfolio-level risk limits before placing an order.
 
     Returns a human-readable reason string if a limit is breached, None otherwise.
-    Checks two guards:
-      1. max_total_exposure_pct — open CopiedTrade costs vs portfolio value.
-      2. max_daily_loss_pct    — today's realized PnL loss vs portfolio value.
+    Checks three guards:
+      1. max_total_exposure_pct      — open CopiedTrade costs vs portfolio value.
+      2. max_daily_loss_pct          — today's realized PnL loss vs portfolio value.
+      3. max_per_trader_exposure_pct — open costs for this signal's trader vs portfolio value.
     """
     # Reference portfolio value: latest snapshot or paper_balance_initial fallback
     latest_snapshot: PortfolioSnapshot | None = (
@@ -106,6 +107,25 @@ def _check_risk_limits(db) -> str | None:
         return (
             f"daily loss {-daily_pnl:.2f} >= "
             f"{settings.max_daily_loss_pct:.0%} limit ({loss_limit:.2f})"
+        )
+
+    # Guard 3: per-trader exposure
+    open_trader_trades = (
+        db.query(CopiedTrade)
+        .join(TradeSignal, CopiedTrade.signal_id == TradeSignal.id)
+        .filter(
+            TradeSignal.trader_id == signal.trader_id,
+            CopiedTrade.status.notin_(["settled", "cancelled"]),
+        )
+        .all()
+    )
+    trader_exposure = sum(t.cost for t in open_trader_trades)
+    trader_limit = portfolio_value * settings.max_per_trader_exposure_pct
+    if trader_exposure >= trader_limit:
+        return (
+            f"per-trader exposure for trader {signal.trader_id} "
+            f"{trader_exposure:.2f} >= "
+            f"{settings.max_per_trader_exposure_pct:.0%} limit ({trader_limit:.2f})"
         )
 
     return None
@@ -174,7 +194,7 @@ async def execute_signal(signal_id: int) -> None:
             )
             return
 
-        risk_error = _check_risk_limits(db)
+        risk_error = _check_risk_limits(db, signal)
         if risk_error:
             signal.status = "skipped"
             db.commit()

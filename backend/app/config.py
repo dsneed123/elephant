@@ -6,8 +6,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     kalshi_api_key: str = ""
     kalshi_private_key_path: str = ""
-    kalshi_base_url: str = "https://api.kalshi.com/trade-api/v2"
-    kalshi_ws_url: str = "wss://api.kalshi.com/trade-api/ws/v2"
+    kalshi_base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
+    kalshi_ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
     database_url: str = "sqlite:///./elephant.db"
 
     # Copy-trading settings
@@ -17,8 +17,8 @@ class Settings(BaseSettings):
     min_trades: int = 20  # Minimum trades to qualify
 
     # Signal generation settings
-    min_signal_confidence: float = 0.7  # Minimum confidence to emit a signal
-    min_elephant_score: float = 80.0  # Minimum elephant_score for signal candidates
+    min_signal_confidence: float = 0.55  # Minimum confidence to emit a signal
+    min_elephant_score: float = 40.0  # Minimum elephant_score for signal candidates
     whale_order_threshold: float = 1000.0  # Minimum USD order size to classify as whale
     signal_ttl_minutes: int = 30  # Pending signals older than this are expired
     auto_execute_threshold: float = 0.85  # Confidence threshold for automatic trade execution
@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # Portfolio risk limits
     max_daily_loss_pct: float = 0.10  # Abort if today's realized loss exceeds 10% of portfolio
     max_total_exposure_pct: float = 0.30  # Abort if open trade costs exceed 30% of portfolio
+    max_per_trader_exposure_pct: float = 0.15  # Abort if open costs for a single trader exceed 15% of portfolio
     stop_loss_pct: float = 0.20  # Close trade if unrealized loss exceeds 20% of entry cost
 
     # Paper trading / dry-run settings

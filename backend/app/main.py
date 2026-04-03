@@ -179,19 +179,12 @@ async def lifespan(app: FastAPI):
         id="portfolio_snapshot",
         replace_existing=True,
     )
-    # Start WebSocket order book monitor immediately as a background task
-    scheduler.add_job(
-        run_orderbook_monitor,
-        trigger="date",
-        id="orderbook_monitor",
-        replace_existing=True,
-    )
     scheduler.start()
     logger.info(
         "APScheduler started — leaderboard scrape every 6 hours, "
         "signal expiry every 5 minutes, stop-loss check every 5 minutes, "
         "trade settlement every 15 minutes, "
-        "portfolio snapshot every 30 minutes, order book monitor running"
+        "portfolio snapshot every 30 minutes"
     )
     if settings.dry_run:
         logger.warning(
@@ -201,8 +194,15 @@ async def lifespan(app: FastAPI):
             settings.paper_balance_initial,
         )
 
+    # Start WebSocket order book monitor as a proper asyncio task
+    # (APScheduler cancels long-running coroutines; asyncio.create_task does not)
+    import asyncio
+    monitor_task = asyncio.create_task(run_orderbook_monitor())
+    logger.info("Order book monitor started as background task")
+
     yield
 
+    monitor_task.cancel()
     scheduler.shutdown(wait=False)
     logger.info("APScheduler shut down")
 
