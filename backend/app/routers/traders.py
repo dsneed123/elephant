@@ -4,11 +4,12 @@ import json
 from datetime import datetime
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.limiter import limiter
 from app.models import TrackedTrader
 from app.services.leaderboard_scraper import scraper
 
@@ -20,7 +21,8 @@ class MarketsUpdate(BaseModel):
 
 
 @router.get("/")
-def list_traders(db: Session = Depends(get_db)):
+@limiter.limit("200/minute")
+def list_traders(request: Request, db: Session = Depends(get_db)):
     """List all tracked traders, sorted by elephant score."""
     traders = db.query(TrackedTrader).filter(
         TrackedTrader.is_active == True
@@ -67,7 +69,8 @@ def update_trader_markets(
 
 
 @router.post("/scrape")
-async def trigger_scrape(db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+async def trigger_scrape(request: Request, db: Session = Depends(get_db)):
     """Manually trigger a Kalshi leaderboard scrape."""
     count = await scraper.scrape(db)
     return {"scraped": count, "timestamp": datetime.utcnow().isoformat()}
