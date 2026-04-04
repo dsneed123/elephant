@@ -1,7 +1,7 @@
 """Database models."""
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, Index
 from sqlalchemy.orm import relationship
 from app.db import Base
 
@@ -44,10 +44,14 @@ class TradeSignal(Base):
     detected_price = Column(Float)
     detected_volume = Column(Float)
     confidence = Column(Float, default=0.0)  # How confident we are this is from a top trader
-    status = Column(String, default="pending")  # pending, copied, skipped, expired
-    created_at = Column(DateTime, default=datetime.utcnow)
+    status = Column(String, default="pending", index=True)  # pending, copied, skipped, expired
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     trader = relationship("TrackedTrader", back_populates="signals")
+
+    __table_args__ = (
+        Index('ix_trade_signals_status_created_at', 'status', 'created_at'),
+    )
 
 
 class CopiedTrade(Base):
@@ -63,11 +67,15 @@ class CopiedTrade(Base):
     price = Column(Float, nullable=False)
     cost = Column(Float, nullable=False)
     kalshi_order_id = Column(String)
-    status = Column(String, default="pending")  # pending, filled, partial, cancelled, settled, simulated
+    status = Column(String, default="pending", index=True)  # pending, filled, partial, cancelled, settled, simulated
     is_simulated = Column(Boolean, nullable=False, default=False, server_default="0")
     pnl = Column(Float, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
     settled_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index('ix_copied_trades_status_created_at', 'status', 'created_at'),
+    )
 
 
 class PortfolioSnapshot(Base):
