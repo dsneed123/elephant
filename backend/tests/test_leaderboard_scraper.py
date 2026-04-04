@@ -156,6 +156,114 @@ class TestComputeElephantScore:
 
 
 # ---------------------------------------------------------------------------
+# _seed_win_rate_prior
+# ---------------------------------------------------------------------------
+
+class TestSeedWinRatePrior:
+    def test_negative_pnl_returns_zero(self, scraper):
+        assert scraper._seed_win_rate_prior(-100.0, 50000.0) == 0.0
+
+    def test_zero_pnl_returns_zero(self, scraper):
+        assert scraper._seed_win_rate_prior(0.0, 50000.0) == 0.0
+
+    def test_positive_pnl_returns_at_least_0_6(self, scraper):
+        result = scraper._seed_win_rate_prior(1.0, 100000.0)
+        assert result >= 0.6
+
+    def test_result_capped_at_0_85(self, scraper):
+        # Very high pnl relative to volume → capped at 0.85
+        result = scraper._seed_win_rate_prior(1_000_000.0, 1.0)
+        assert result == pytest.approx(0.85, abs=0.001)
+
+    def test_high_pnl_to_volume_ratio_approaches_cap(self, scraper):
+        result = scraper._seed_win_rate_prior(9000.0, 1000.0)
+        assert 0.6 <= result <= 0.85
+
+    def test_zero_volume_with_positive_pnl(self, scraper):
+        # volume=0 → denominator is just pnl → pnl/(pnl+0) = 1.0 → 0.6+1.0=1.6 → capped 0.85
+        result = scraper._seed_win_rate_prior(500.0, 0.0)
+        assert result == pytest.approx(0.85, abs=0.001)
+
+
+# ---------------------------------------------------------------------------
+# has_trade_history flag in _upsert_trader
+# ---------------------------------------------------------------------------
+
+class TestHasTradeHistoryFlag:
+    def _base_data(self, **kwargs):
+        data = {
+            "nickname": "SeedTrader",
+            "pnl": 3000.0,
+            "volume": 30000.0,
+            "markets_traded": 10,
+            "rank_pnl": 4,
+            "rank_volume": 6,
+            "rank_markets": 2,
+        }
+        data.update(kwargs)
+        return data
+
+    def test_new_trader_has_trade_history_false(self, scraper, db):
+        trader = scraper._upsert_trader(db, self._base_data())
+        db.flush()
+        assert trader.has_trade_history is False
+
+    def test_new_trader_seeded_win_rate_above_zero_when_pnl_positive(self, scraper, db):
+        trader = scraper._upsert_trader(db, self._base_data(pnl=3000.0, volume=30000.0))
+        db.flush()
+        assert trader.win_rate > 0.0
+        assert trader.win_rate >= 0.6
+        assert trader.win_rate <= 0.85
+
+    def test_new_trader_seeded_consistency_0_5_when_pnl_positive(self, scraper, db):
+        trader = scraper._upsert_trader(db, self._base_data(pnl=3000.0, volume=30000.0))
+        db.flush()
+        assert trader.consistency_score == pytest.approx(0.5, abs=0.001)
+
+    def test_new_trader_zero_pnl_win_rate_stays_zero(self, scraper, db):
+        trader = scraper._upsert_trader(db, self._base_data(pnl=0.0, volume=30000.0))
+        db.flush()
+        assert trader.win_rate == 0.0
+        assert trader.consistency_score == 0.0
+
+    def test_existing_trader_without_trade_history_win_rate_refreshed(self, scraper, db):
+        # Use pnl values that stay below the 0.85 cap so we can see the change.
+        # pnl=200, volume=30000 → 0.6 + 200/3200 ≈ 0.663
+        scraper._upsert_trader(db, self._base_data(pnl=200.0, volume=30000.0))
+        db.commit()
+        old_win_rate = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "seedtrader"
+        ).first().win_rate
+
+        # pnl=500, volume=30000 → 0.6 + 500/3500 ≈ 0.743 (still below cap)
+        scraper._upsert_trader(db, self._base_data(pnl=500.0, volume=30000.0))
+        db.commit()
+        new_win_rate = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "seedtrader"
+        ).first().win_rate
+        assert new_win_rate > old_win_rate
+
+    def test_existing_trader_with_trade_history_win_rate_not_overwritten(self, scraper, db):
+        # Insert trader and mark has_trade_history=True with a specific win_rate
+        scraper._upsert_trader(db, self._base_data(pnl=3000.0, volume=30000.0))
+        db.commit()
+        trader = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "seedtrader"
+        ).first()
+        trader.has_trade_history = True
+        trader.win_rate = 0.72  # real history value
+        db.commit()
+
+        # Re-upsert with different pnl → seeded prior must NOT overwrite real win_rate
+        scraper._upsert_trader(db, self._base_data(pnl=9000.0, volume=30000.0))
+        db.commit()
+        updated = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "seedtrader"
+        ).first()
+        assert updated.win_rate == pytest.approx(0.72, abs=0.001)
+
+
+# ---------------------------------------------------------------------------
 # _assign_tier
 # ---------------------------------------------------------------------------
 
