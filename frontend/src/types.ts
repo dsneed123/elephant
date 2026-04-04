@@ -53,6 +53,9 @@ export interface PortfolioPerformance {
   total_pnl: number
   total_trades: number
   win_rate: number
+  sharpe_ratio: number | null
+  sortino_ratio: number | null
+  max_drawdown: number | null
 }
 
 export interface AppSettings {

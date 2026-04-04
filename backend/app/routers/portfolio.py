@@ -1,6 +1,8 @@
 """Portfolio and copy-trading endpoints."""
 
 import logging
+import math
+import statistics
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
@@ -61,6 +63,41 @@ async def portfolio_performance(db: Session = Depends(get_db)):
             logger.warning("Could not fetch Kalshi balance: %s", exc)
             balance = latest.balance if latest else 0
 
+    all_snapshots = db.query(PortfolioSnapshot).order_by(
+        PortfolioSnapshot.created_at.asc()
+    ).all()
+
+    sharpe_ratio = None
+    sortino_ratio = None
+    max_drawdown = None
+
+    if len(all_snapshots) >= 2:
+        returns = [
+            all_snapshots[i].total_pnl - all_snapshots[i - 1].total_pnl
+            for i in range(1, len(all_snapshots))
+        ]
+        mean_ret = statistics.mean(returns)
+        std_ret = statistics.stdev(returns) if len(returns) >= 2 else 0.0
+
+        if std_ret != 0:
+            sharpe_ratio = (mean_ret / std_ret) * math.sqrt(252)
+
+        downside_sq_sum = sum(r * r for r in returns if r < 0)
+        downside_dev = math.sqrt(downside_sq_sum / len(returns)) if downside_sq_sum > 0 else 0.0
+        if downside_dev != 0:
+            sortino_ratio = (mean_ret / downside_dev) * math.sqrt(252)
+
+        peak = all_snapshots[0].total_value
+        max_dd = 0.0
+        for snap in all_snapshots:
+            if snap.total_value > peak:
+                peak = snap.total_value
+            if peak > 0:
+                dd = (peak - snap.total_value) / peak
+                if dd > max_dd:
+                    max_dd = dd
+        max_drawdown = max_dd
+
     return {
         "mode": "paper" if settings.dry_run else "live",
         "balance": balance,
@@ -68,6 +105,9 @@ async def portfolio_performance(db: Session = Depends(get_db)):
         "total_pnl": total_pnl,
         "total_trades": total_trades,
         "win_rate": winning / total_trades if total_trades > 0 else 0,
+        "sharpe_ratio": sharpe_ratio,
+        "sortino_ratio": sortino_ratio,
+        "max_drawdown": max_drawdown,
     }
 
 

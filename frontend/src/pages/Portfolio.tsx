@@ -146,6 +146,51 @@ export default function Portfolio() {
         />
       </div>
 
+      {/* Risk metrics */}
+      <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
+        <StatCard
+          label="Sharpe Ratio"
+          value={perf?.sharpe_ratio != null ? fmt(perf.sharpe_ratio) : '—'}
+          sub="Annualized"
+          color={
+            perf?.sharpe_ratio != null
+              ? perf.sharpe_ratio >= 1
+                ? 'text-emerald-400'
+                : perf.sharpe_ratio >= 0
+                  ? 'text-amber-400'
+                  : 'text-red-400'
+              : 'text-white'
+          }
+        />
+        <StatCard
+          label="Sortino Ratio"
+          value={perf?.sortino_ratio != null ? fmt(perf.sortino_ratio) : '—'}
+          sub="Annualized"
+          color={
+            perf?.sortino_ratio != null
+              ? perf.sortino_ratio >= 1
+                ? 'text-emerald-400'
+                : perf.sortino_ratio >= 0
+                  ? 'text-amber-400'
+                  : 'text-red-400'
+              : 'text-white'
+          }
+        />
+        <StatCard
+          label="Max Drawdown"
+          value={perf?.max_drawdown != null ? `${(perf.max_drawdown * 100).toFixed(2)}%` : '—'}
+          color={
+            perf?.max_drawdown != null
+              ? perf.max_drawdown <= 0.05
+                ? 'text-emerald-400'
+                : perf.max_drawdown <= 0.15
+                  ? 'text-amber-400'
+                  : 'text-red-400'
+              : 'text-white'
+          }
+        />
+      </div>
+
       {/* Portfolio value chart */}
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
         <h2 className="text-sm font-medium text-zinc-300 mb-4">Portfolio Value Over Time</h2>
