@@ -1,4 +1,5 @@
 import { NavLink, Outlet } from 'react-router-dom'
+import { useWebSocket } from '../contexts/WebSocketContext'
 
 const navItems = [
   { to: '/dashboard', label: 'Dashboard' },
@@ -10,6 +11,8 @@ const navItems = [
 ]
 
 export default function Layout() {
+  const { connected } = useWebSocket()
+
   return (
     <div className="flex h-screen overflow-hidden">
       {/* Sidebar */}
@@ -35,8 +38,13 @@ export default function Layout() {
             </NavLink>
           ))}
         </nav>
-        <div className="px-5 py-4 border-t border-zinc-800 text-xs text-zinc-600">
-          v0.1.0
+        <div className="px-5 py-4 border-t border-zinc-800 text-xs text-zinc-600 space-y-1">
+          {!connected && (
+            <span className="block px-2 py-1 rounded bg-yellow-500/20 text-yellow-400 text-xs font-medium">
+              Reconnecting...
+            </span>
+          )}
+          <span>v0.1.0</span>
         </div>
       </aside>
 
