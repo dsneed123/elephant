@@ -99,6 +99,127 @@ class TestOrderbookMonitorHealthCheck:
         assert monitor.health_check()["last_message_at"] is None
 
 
+class TestSubscriptionRefresh:
+    @pytest.mark.asyncio
+    async def test_subscribes_to_new_tickers(self):
+        """Refresh sends a subscribe message when new markets are discovered."""
+        monitor = OrderbookMonitor()
+        monitor._subscribed_markets = {"INFL-25"}
+
+        sent_messages = []
+        call_count = 0
+
+        async def fake_sleep(seconds):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise asyncio.CancelledError()
+
+        class FakeWS:
+            async def send(self, data):
+                sent_messages.append(json.loads(data))
+
+        with (
+            patch(
+                "app.services.orderbook_monitor._get_tracked_market_tickers",
+                return_value=["INFL-25", "BTCUSD"],
+            ),
+            patch("asyncio.sleep", side_effect=fake_sleep),
+        ):
+            try:
+                await monitor._refresh_subscriptions(FakeWS())
+            except asyncio.CancelledError:
+                pass
+
+        assert len(sent_messages) == 1
+        msg = sent_messages[0]
+        assert msg["cmd"] == "subscribe"
+        assert msg["params"]["channels"] == ["orderbook_delta"]
+        assert "BTCUSD" in msg["params"]["market_tickers"]
+        assert "INFL-25" not in msg["params"]["market_tickers"]
+        assert "BTCUSD" in monitor._subscribed_markets
+        assert "INFL-25" in monitor._subscribed_markets
+
+    @pytest.mark.asyncio
+    async def test_no_send_when_no_new_tickers(self):
+        """Refresh does not send a message when all tickers are already subscribed."""
+        monitor = OrderbookMonitor()
+        monitor._subscribed_markets = {"INFL-25", "BTCUSD"}
+
+        sent_messages = []
+        call_count = 0
+
+        async def fake_sleep(seconds):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise asyncio.CancelledError()
+
+        class FakeWS:
+            async def send(self, data):
+                sent_messages.append(json.loads(data))
+
+        with (
+            patch(
+                "app.services.orderbook_monitor._get_tracked_market_tickers",
+                return_value=["INFL-25", "BTCUSD"],
+            ),
+            patch("asyncio.sleep", side_effect=fake_sleep),
+        ):
+            try:
+                await monitor._refresh_subscriptions(FakeWS())
+            except asyncio.CancelledError:
+                pass
+
+        assert len(sent_messages) == 0
+
+    @pytest.mark.asyncio
+    async def test_refresh_task_cancelled_on_connection_end(self):
+        """The subscription refresh task is done (cancelled) when the WS message loop exits."""
+        monitor = OrderbookMonitor()
+        monitor._attempt = 5
+
+        raw_msg = json.dumps({"type": "orderbook_delta", "msg": {"delta": 0}})
+
+        class FakeWS:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def send(self, data):
+                pass
+
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                yield raw_msg
+
+        fake_ws = FakeWS()
+        created_tasks: list = []
+        real_create_task = asyncio.create_task
+
+        def spy_create_task(coro, **kwargs):
+            task = real_create_task(coro, **kwargs)
+            created_tasks.append(task)
+            return task
+
+        with (
+            patch("app.services.orderbook_monitor._make_auth_headers", return_value={}),
+            patch("app.services.orderbook_monitor.settings") as mock_settings,
+            patch("websockets.connect", return_value=fake_ws),
+            patch("asyncio.create_task", side_effect=spy_create_task),
+        ):
+            mock_settings.kalshi_ws_url = "wss://fake"
+            mock_settings.whale_order_threshold = 1000.0
+            await monitor._run_connection(["INFL-25"], MagicMock())
+
+        assert len(created_tasks) == 1
+        assert created_tasks[0].done()
+
+
 class TestOrderbookMonitorReconnection:
     @pytest.mark.asyncio
     async def test_resets_attempt_on_first_message(self):
