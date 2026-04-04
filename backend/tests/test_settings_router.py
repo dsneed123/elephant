@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.config import settings as live_settings
 from app.routers.settings import _load, _save, AppSettings, _SETTINGS_FILE, _STATE_DIR
 
 
@@ -138,3 +139,12 @@ class TestPatchSettings:
         resp = client.patch("/api/settings/", json={})
         assert resp.status_code == 200
         assert resp.json() == before
+
+    def test_patch_updates_live_settings_in_memory(self, client):
+        """PATCH must hot-reload the in-memory settings singleton."""
+        new_confidence = 0.77
+        resp = client.patch(
+            "/api/settings/", json={"min_confidence_threshold": new_confidence}
+        )
+        assert resp.status_code == 200
+        assert live_settings.min_signal_confidence == new_confidence

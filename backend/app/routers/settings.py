@@ -10,6 +10,18 @@ from pydantic import BaseModel, field_validator
 
 from app.config import settings as env_settings
 
+# Maps AppSettings field names → Settings (app.config) attribute names
+_LIVE_FIELD_MAP: dict[str, str] = {
+    "max_exposure_pct": "max_total_exposure_pct",
+    "max_daily_loss_pct": "max_daily_loss_pct",
+    "max_per_trader_exposure_pct": "max_per_trader_exposure_pct",
+    "stop_loss_pct": "stop_loss_pct",
+    "min_confidence_threshold": "min_signal_confidence",
+    "whale_order_threshold": "whale_order_threshold",
+    "paper_trading_mode": "dry_run",
+    "paper_balance": "paper_balance_initial",
+}
+
 logger = logging.getLogger(__name__)
 
 _STATE_DIR = Path(__file__).parent.parent.parent / "state"
@@ -85,6 +97,13 @@ def _save(s: AppSettings) -> None:
     _SETTINGS_FILE.write_text(json.dumps(s.model_dump(), indent=2))
 
 
+def _apply_to_live_settings(patch: dict) -> None:
+    """Mutate the in-memory settings singleton for each key in *patch*."""
+    for app_key, value in patch.items():
+        live_key = _LIVE_FIELD_MAP.get(app_key, app_key)
+        setattr(env_settings, live_key, value)
+
+
 @router.get("/", response_model=AppSettings)
 def get_settings():
     """Return current runtime settings."""
@@ -98,4 +117,5 @@ def patch_settings(patch: SettingsPatch):
     updates = patch.model_dump(exclude_none=True)
     updated = current.model_copy(update=updates)
     _save(updated)
+    _apply_to_live_settings(updates)
     return updated
