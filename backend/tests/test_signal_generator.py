@@ -218,6 +218,44 @@ class TestProcessWhaleEventCore:
 
         assert signals == []
 
+    def test_disabled_trader_creates_no_signal(self, db):
+        """is_enabled=False excludes a trader even when is_active=True and score is high."""
+        trader = TrackedTrader(
+            kalshi_username="disabled_whale",
+            elephant_score=90.0,
+            win_rate=0.75,
+            total_trades=50,
+            is_active=True,
+            is_enabled=False,
+        )
+        db.add(trader)
+        db.commit()
+
+        event = self._whale_event()
+        signals = process_whale_event(event, db)
+
+        assert signals == []
+
+    def test_active_and_enabled_trader_creates_signal(self, db):
+        """is_active=True and is_enabled=True together allow signal creation."""
+        trader = TrackedTrader(
+            kalshi_username="enabled_whale",
+            elephant_score=90.0,
+            win_rate=0.75,
+            total_trades=50,
+            is_active=True,
+            is_enabled=True,
+        )
+        db.add(trader)
+        db.commit()
+        db.refresh(trader)
+
+        event = self._whale_event()
+        signals = process_whale_event(event, db)
+
+        assert len(signals) == 1
+        assert signals[0].status == "pending"
+
 
 # ---------------------------------------------------------------------------
 # _compute_confidence — unit tests for the confidence formula

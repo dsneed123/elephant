@@ -11,6 +11,7 @@ export interface TrackedTrader {
   elephant_score: number
   tier: string
   is_active: boolean
+  is_enabled: boolean
   last_seen: string | null
   created_at: string
 }

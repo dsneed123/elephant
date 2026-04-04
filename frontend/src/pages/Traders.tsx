@@ -19,6 +19,7 @@ export default function Traders() {
   const [sortKey, setSortKey] = useState<SortKey>('elephant_score')
   const [scraping, setScraping] = useState(false)
   const [scrapeMsg, setScrapeMsg] = useState<string | null>(null)
+  const [togglingId, setTogglingId] = useState<number | null>(null)
 
   useEffect(() => {
     Promise.all([api.traders.list(), api.portfolio.traderPnl()])
@@ -43,6 +44,17 @@ export default function Traders() {
     }
     return b[sortKey] - a[sortKey]
   })
+
+  const handleToggleEnabled = (trader: import('../types').TrackedTrader) => {
+    setTogglingId(trader.id)
+    api.traders
+      .patch(trader.id, { is_enabled: !trader.is_enabled })
+      .then((updated) => {
+        setTraders((prev) => prev.map((t) => (t.id === updated.id ? updated : t)))
+      })
+      .catch((e: Error) => setScrapeMsg(`Error: ${e.message}`))
+      .finally(() => setTogglingId(null))
+  }
 
   const handleScrape = () => {
     setScraping(true)
@@ -122,6 +134,7 @@ export default function Traders() {
                 <th className="px-5 py-3 text-right">Copied P&L</th>
                 <th className="px-5 py-3 text-right">ROI</th>
                 <th className="px-5 py-3 text-center">Active</th>
+                <th className="px-5 py-3 text-center">Enabled</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800">
@@ -196,6 +209,22 @@ export default function Traders() {
                         t.is_active ? 'bg-emerald-400' : 'bg-zinc-600'
                       }`}
                     />
+                  </td>
+                  <td className="px-5 py-3 text-center">
+                    <button
+                      disabled={togglingId === t.id}
+                      onClick={() => handleToggleEnabled(t)}
+                      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed ${
+                        t.is_enabled ? 'bg-emerald-600' : 'bg-zinc-600'
+                      }`}
+                      aria-label={t.is_enabled ? 'Disable trader' : 'Enable trader'}
+                    >
+                      <span
+                        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                          t.is_enabled ? 'translate-x-4' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
                   </td>
                 </tr>
               ))}

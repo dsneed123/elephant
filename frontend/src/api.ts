@@ -27,6 +27,15 @@ export const api = {
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
         return r.json() as Promise<{ scraped: number; timestamp: string }>
       }),
+    patch: (id: number, data: { is_enabled: boolean }) =>
+      fetch(`${BASE}/traders/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      }).then((r) => {
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+        return r.json() as Promise<TrackedTrader>
+      }),
   },
 
   signals: {

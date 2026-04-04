@@ -90,6 +90,7 @@ def process_whale_event(event: WhaleEvent, db: Session) -> list[TradeSignal]:
         db.query(TrackedTrader)
         .filter(
             TrackedTrader.is_active == True,  # noqa: E712
+            TrackedTrader.is_enabled == True,  # noqa: E712
             TrackedTrader.elephant_score >= settings.min_elephant_score,
         )
         .all()
