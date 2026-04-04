@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _BASE_BACKOFF = 1.0
 _MAX_BACKOFF = 60.0
+_SUBSCRIPTION_REFRESH_INTERVAL = 600  # seconds between subscription refresh checks
 
 
 def _load_private_key():
@@ -223,6 +224,35 @@ class OrderbookMonitor:
 
             self._attempt += 1
 
+    async def _refresh_subscriptions(self, ws) -> None:
+        """Periodically check for new tracked markets and subscribe to them on the open socket."""
+        while True:
+            await asyncio.sleep(_SUBSCRIPTION_REFRESH_INTERVAL)
+            try:
+                current_tickers = set(_get_tracked_market_tickers())
+                new_tickers = current_tickers - self._subscribed_markets
+                if not new_tickers:
+                    continue
+                logger.info(
+                    "Subscription refresh: %d new markets found, subscribing", len(new_tickers)
+                )
+                subscribe_msg = {
+                    "id": 2,
+                    "cmd": "subscribe",
+                    "params": {
+                        "channels": ["orderbook_delta"],
+                        "market_tickers": list(new_tickers),
+                    },
+                }
+                await ws.send(json.dumps(subscribe_msg))
+                self._subscribed_markets.update(new_tickers)
+                logger.info(
+                    "Subscription refresh complete; now tracking %d markets",
+                    len(self._subscribed_markets),
+                )
+            except Exception:
+                logger.exception("Error during subscription refresh; will retry next interval")
+
     async def _run_connection(self, tickers: list[str], private_key) -> None:
         """Open a single WebSocket connection, subscribe, and process messages."""
         self._subscribed_markets = set(tickers)
@@ -244,55 +274,63 @@ class OrderbookMonitor:
             self._connected = True
             first_message = True
 
-            async for raw in ws:
-                try:
-                    envelope = json.loads(raw)
-                except json.JSONDecodeError:
-                    logger.warning("Received non-JSON WebSocket message; skipping")
-                    continue
+            refresh_task = asyncio.create_task(self._refresh_subscriptions(ws))
+            try:
+                async for raw in ws:
+                    try:
+                        envelope = json.loads(raw)
+                    except json.JSONDecodeError:
+                        logger.warning("Received non-JSON WebSocket message; skipping")
+                        continue
 
-                self._last_message_at = datetime.now(timezone.utc)
+                    self._last_message_at = datetime.now(timezone.utc)
 
-                if first_message:
-                    first_message = False
-                    self._attempt = 0
-                    logger.info("First message received; reconnect attempt counter reset")
+                    if first_message:
+                        first_message = False
+                        self._attempt = 0
+                        logger.info("First message received; reconnect attempt counter reset")
 
-                if envelope.get("type") != "orderbook_delta":
-                    continue
+                    if envelope.get("type") != "orderbook_delta":
+                        continue
 
-                msg = envelope.get("msg", {})
-                event = _detect_whale(msg)
-                if event is None:
-                    continue
+                    msg = envelope.get("msg", {})
+                    event = _detect_whale(msg)
+                    if event is None:
+                        continue
 
-                logger.info(
-                    "Whale detected: %s %s %s $%.2f",
-                    event.market_ticker,
-                    event.side,
-                    event.action,
-                    event.order_size,
-                )
-
-                try:
-                    market_data = await get_kalshi_client().get_market(event.market_ticker)
-                    event.market_title = market_data.get("title")
-                except Exception:
-                    logger.warning(
-                        "Could not fetch market title for %s; market_title will be NULL",
+                    logger.info(
+                        "Whale detected: %s %s %s $%.2f",
                         event.market_ticker,
+                        event.side,
+                        event.action,
+                        event.order_size,
                     )
 
-                from app.db import SessionLocal
-                db = SessionLocal()
+                    try:
+                        market_data = await get_kalshi_client().get_market(event.market_ticker)
+                        event.market_title = market_data.get("title")
+                    except Exception:
+                        logger.warning(
+                            "Could not fetch market title for %s; market_title will be NULL",
+                            event.market_ticker,
+                        )
+
+                    from app.db import SessionLocal
+                    db = SessionLocal()
+                    try:
+                        process_whale_event(event, db)
+                    except Exception:
+                        logger.exception(
+                            "Error processing whale event for %s", event.market_ticker
+                        )
+                    finally:
+                        db.close()
+            finally:
+                refresh_task.cancel()
                 try:
-                    process_whale_event(event, db)
-                except Exception:
-                    logger.exception(
-                        "Error processing whale event for %s", event.market_ticker
-                    )
-                finally:
-                    db.close()
+                    await refresh_task
+                except asyncio.CancelledError:
+                    pass
 
 
 # Module-level singleton — imported by main.py for scheduling and health checks.
