@@ -20,6 +20,10 @@ class MarketsUpdate(BaseModel):
     markets: List[str]
 
 
+class TraderUpdate(BaseModel):
+    is_enabled: bool
+
+
 @router.get("/")
 @limiter.limit("200/minute")
 def list_traders(request: Request, db: Session = Depends(get_db)):
@@ -48,6 +52,21 @@ def get_trader(username: str, db: Session = Depends(get_db)):
     ).first()
     if not trader:
         return {"error": "Trader not found"}
+    return trader
+
+
+@router.patch("/{trader_id}")
+def update_trader(
+    trader_id: int,
+    payload: TraderUpdate,
+    db: Session = Depends(get_db),
+):
+    """Toggle a trader's is_enabled flag."""
+    trader = db.query(TrackedTrader).filter(TrackedTrader.id == trader_id).first()
+    if not trader:
+        raise HTTPException(status_code=404, detail="Trader not found")
+    trader.is_enabled = payload.is_enabled
+    db.commit()
     return trader
 
 

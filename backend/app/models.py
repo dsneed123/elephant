@@ -24,6 +24,7 @@ class TrackedTrader(Base):
     tier = Column(String, default="unranked")  # top_001, top_01, top_1, etc.
     top_markets = Column(Text, nullable=True)  # JSON list of market tickers this trader favors
     is_active = Column(Boolean, default=True)
+    is_enabled = Column(Boolean, default=True)
     last_seen = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
