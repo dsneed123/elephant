@@ -224,8 +224,8 @@ class TestScenario1_WhaleToAutoExecution:
 
     def test_high_confidence_schedules_auto_execution(self, db):
         """
-        elephant_score=90, order_size=5000 →
-          confidence = 0.5 + (90/100)*0.3 + (5000/10000)*0.2 = 0.87 ≥ 0.85 threshold
+        elephant_score=90, order_size=30_000, win_rate=0.75 →
+          confidence = 0.75*0.40 + 0.90*0.35 + (log10(30000)/log10(50000))*0.25 ≈ 0.853 ≥ 0.85 threshold
         """
         from app.services.signal_generator import process_whale_event
 
@@ -235,7 +235,7 @@ class TestScenario1_WhaleToAutoExecution:
             market_ticker="NASDAQ-24DEC31",
             side="yes",
             action="buy",
-            order_size=5000.0,
+            order_size=30_000.0,
             price=40.0,
         )
 
