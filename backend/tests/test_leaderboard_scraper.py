@@ -161,28 +161,39 @@ class TestComputeElephantScore:
 
 class TestSeedWinRatePrior:
     def test_negative_pnl_returns_zero(self, scraper):
-        assert scraper._seed_win_rate_prior(-100.0, 50000.0) == 0.0
+        assert scraper._seed_win_rate_prior(-100.0, 50000.0, 20) == 0.0
 
     def test_zero_pnl_returns_zero(self, scraper):
-        assert scraper._seed_win_rate_prior(0.0, 50000.0) == 0.0
+        assert scraper._seed_win_rate_prior(0.0, 50000.0, 20) == 0.0
 
-    def test_positive_pnl_returns_at_least_0_6(self, scraper):
-        result = scraper._seed_win_rate_prior(1.0, 100000.0)
-        assert result >= 0.6
+    def test_positive_pnl_no_markets_returns_neutral_prior(self, scraper):
+        # No market-count data → pure Bayesian prior (0+2)/(0+4) = 0.5
+        result = scraper._seed_win_rate_prior(100.0, 50000.0, 0)
+        assert result == pytest.approx(0.5, abs=0.001)
 
-    def test_result_capped_at_0_85(self, scraper):
-        # Very high pnl relative to volume → capped at 0.85
-        result = scraper._seed_win_rate_prior(1_000_000.0, 1.0)
-        assert result == pytest.approx(0.85, abs=0.001)
+    def test_high_volume_low_pnl_not_floored_at_0_6(self, scraper):
+        # High-volume low-margin trader: pnl << volume → win rate near 0.5, not 0.6
+        result = scraper._seed_win_rate_prior(1.0, 100000.0, 100)
+        assert result < 0.6
 
-    def test_high_pnl_to_volume_ratio_approaches_cap(self, scraper):
-        result = scraper._seed_win_rate_prior(9000.0, 1000.0)
-        assert 0.6 <= result <= 0.85
+    def test_high_pnl_ratio_can_exceed_old_cap(self, scraper):
+        # No hard cap at 0.85 — very profitable traders can score higher
+        result = scraper._seed_win_rate_prior(1_000_000.0, 1.0, 20)
+        assert result > 0.85
+
+    def test_moderate_pnl_returns_above_half(self, scraper):
+        # pnl=3000, volume=30000, markets=10 → wins≈6/10 → Bayesian ≈ 0.571
+        result = scraper._seed_win_rate_prior(3000.0, 30000.0, 10)
+        assert result > 0.5
 
     def test_zero_volume_with_positive_pnl(self, scraper):
-        # volume=0 → denominator is just pnl → pnl/(pnl+0) = 1.0 → 0.6+1.0=1.6 → capped 0.85
-        result = scraper._seed_win_rate_prior(500.0, 0.0)
-        assert result == pytest.approx(0.85, abs=0.001)
+        # volume=0 → treat as all wins → Bayesian near upper range
+        result = scraper._seed_win_rate_prior(500.0, 0.0, 10)
+        assert result > 0.5
+
+    def test_result_in_valid_range(self, scraper):
+        result = scraper._seed_win_rate_prior(9000.0, 1000.0, 20)
+        assert 0.0 < result <= 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +223,8 @@ class TestHasTradeHistoryFlag:
         trader = scraper._upsert_trader(db, self._base_data(pnl=3000.0, volume=30000.0))
         db.flush()
         assert trader.win_rate > 0.0
-        assert trader.win_rate >= 0.6
-        assert trader.win_rate <= 0.85
+        # Bayesian estimator: no hard floor at 0.60 or cap at 0.85
+        assert 0.0 < trader.win_rate <= 1.0
 
     def test_new_trader_seeded_consistency_0_5_when_pnl_positive(self, scraper, db):
         trader = scraper._upsert_trader(db, self._base_data(pnl=3000.0, volume=30000.0))
@@ -227,16 +238,16 @@ class TestHasTradeHistoryFlag:
         assert trader.consistency_score == 0.0
 
     def test_existing_trader_without_trade_history_win_rate_refreshed(self, scraper, db):
-        # Use pnl values that stay below the 0.85 cap so we can see the change.
-        # pnl=200, volume=30000 → 0.6 + 200/3200 ≈ 0.663
-        scraper._upsert_trader(db, self._base_data(pnl=200.0, volume=30000.0))
+        # Use pnl values large enough to shift the rounded wins estimate.
+        # pnl=1000, volume=30000, markets=10 → win_fraction≈0.517 → wins=5 → 7/14≈0.50
+        scraper._upsert_trader(db, self._base_data(pnl=1000.0, volume=30000.0))
         db.commit()
         old_win_rate = db.query(TrackedTrader).filter(
             TrackedTrader.kalshi_username == "seedtrader"
         ).first().win_rate
 
-        # pnl=500, volume=30000 → 0.6 + 500/3500 ≈ 0.743 (still below cap)
-        scraper._upsert_trader(db, self._base_data(pnl=500.0, volume=30000.0))
+        # pnl=10000, volume=30000, markets=10 → win_fraction≈0.667 → wins=7 → 9/14≈0.643
+        scraper._upsert_trader(db, self._base_data(pnl=10000.0, volume=30000.0))
         db.commit()
         new_win_rate = db.query(TrackedTrader).filter(
             TrackedTrader.kalshi_username == "seedtrader"
@@ -747,6 +758,113 @@ class TestFetchTopMarketsForTrader:
         parsed = json.loads(result)
         assert "ALT-MKT-1" in parsed
         assert "ALT-MKT-2" in parsed
+
+
+# ---------------------------------------------------------------------------
+# _fetch_win_rate_from_settled_markets
+# ---------------------------------------------------------------------------
+
+class TestFetchWinRateFromSettledMarkets:
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _make_client(self, settled_markets, portfolio_trades=None, portfolio_status=200):
+        """Build an AsyncMock client that returns the given data."""
+        settled_resp = _make_http_response(200, {"markets": settled_markets})
+        if portfolio_trades is not None:
+            portfolio_resp = _make_http_response(portfolio_status, {"trades": portfolio_trades})
+        else:
+            portfolio_resp = _make_http_response(portfolio_status, {"trades": []})
+
+        if portfolio_status == 403:
+            portfolio_resp.status_code = 403
+            portfolio_resp.raise_for_status = MagicMock()
+
+        async def fake_get(url, params=None):
+            if "portfolio/trades" in url:
+                return portfolio_resp
+            return settled_resp
+
+        client = AsyncMock()
+        client.get = AsyncMock(side_effect=fake_get)
+        return client
+
+    def test_returns_bayesian_rate_from_matched_trades(self, scraper):
+        settled = [
+            {"ticker": "MKT-A", "result": "yes"},
+            {"ticker": "MKT-B", "result": "no"},
+        ]
+        trades = [
+            {"ticker": "MKT-A", "side": "yes"},  # win
+            {"ticker": "MKT-B", "side": "yes"},  # loss
+        ]
+        client = self._make_client(settled, trades)
+        # wins=1, total=2 → (1+2)/(2+4) = 0.5
+        result = self._run(
+            scraper._fetch_win_rate_from_settled_markets(client, "trader1", 500.0, 10000.0, 10)
+        )
+        assert result == pytest.approx(0.5, abs=0.001)
+
+    def test_all_wins_applies_shrinkage(self, scraper):
+        settled = [{"ticker": f"MKT-{i}", "result": "yes"} for i in range(4)]
+        trades = [{"ticker": f"MKT-{i}", "side": "yes"} for i in range(4)]
+        client = self._make_client(settled, trades)
+        # wins=4, total=4 → (4+2)/(4+4) = 0.75
+        result = self._run(
+            scraper._fetch_win_rate_from_settled_markets(client, "trader1", 500.0, 10000.0, 10)
+        )
+        assert result == pytest.approx(0.75, abs=0.001)
+
+    def test_falls_back_to_prior_on_403(self, scraper):
+        settled = [{"ticker": "MKT-A", "result": "yes"}]
+        client = self._make_client(settled, portfolio_trades=None, portfolio_status=403)
+        # pnl=3000, volume=30000, markets=10 → Bayesian prior
+        expected = scraper._seed_win_rate_prior(3000.0, 30000.0, 10)
+        result = self._run(
+            scraper._fetch_win_rate_from_settled_markets(client, "private", 3000.0, 30000.0, 10)
+        )
+        assert result == pytest.approx(expected, abs=0.001)
+
+    def test_falls_back_to_prior_when_no_settled_markets(self, scraper):
+        client = self._make_client(settled_markets=[], portfolio_trades=[])
+        expected = scraper._seed_win_rate_prior(3000.0, 30000.0, 10)
+        result = self._run(
+            scraper._fetch_win_rate_from_settled_markets(client, "trader1", 3000.0, 30000.0, 10)
+        )
+        assert result == pytest.approx(expected, abs=0.001)
+
+    def test_falls_back_to_prior_when_no_overlap(self, scraper):
+        settled = [{"ticker": "MKT-X", "result": "yes"}]
+        trades = [{"ticker": "MKT-Y", "side": "yes"}]  # different ticker — no overlap
+        client = self._make_client(settled, trades)
+        expected = scraper._seed_win_rate_prior(3000.0, 30000.0, 10)
+        result = self._run(
+            scraper._fetch_win_rate_from_settled_markets(client, "trader1", 3000.0, 30000.0, 10)
+        )
+        assert result == pytest.approx(expected, abs=0.001)
+
+    def test_falls_back_to_prior_on_network_error(self, scraper):
+        client = AsyncMock()
+        client.get = AsyncMock(side_effect=httpx.RequestError("timeout"))
+        expected = scraper._seed_win_rate_prior(1000.0, 5000.0, 20)
+        result = self._run(
+            scraper._fetch_win_rate_from_settled_markets(client, "trader1", 1000.0, 5000.0, 20)
+        )
+        assert result == pytest.approx(expected, abs=0.001)
+
+    def test_no_hard_floor_at_0_6(self, scraper):
+        # 2 wins out of 6 → (2+2)/(6+4) = 0.4 — below old floor of 0.60
+        settled = [{"ticker": f"MKT-{i}", "result": "yes"} for i in range(6)]
+        trades = (
+            [{"ticker": f"MKT-{i}", "side": "yes"} for i in range(2)]   # 2 wins
+            + [{"ticker": f"MKT-{i}", "side": "no"} for i in range(2, 6)]  # 4 losses
+        )
+        client = self._make_client(settled, trades)
+        result = self._run(
+            scraper._fetch_win_rate_from_settled_markets(client, "trader1", 500.0, 10000.0, 10)
+        )
+        assert result == pytest.approx(0.4, abs=0.001)
+        assert result < 0.6  # not floored at old minimum
 
 
 class TestEnrichWithTopMarkets:
