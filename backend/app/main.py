@@ -7,10 +7,14 @@ from contextlib import asynccontextmanager
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from app.config import settings as app_settings
+from app.limiter import limiter
 from app.db import SessionLocal
 from app.middleware.auth import APIKeyMiddleware
 from app.websocket_manager import get_manager
@@ -235,6 +239,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000"],
@@ -243,6 +249,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(APIKeyMiddleware)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
 
 app.include_router(traders.router, prefix="/api/traders", tags=["traders"])
 app.include_router(markets.router, prefix="/api/markets", tags=["markets"])

@@ -1,8 +1,9 @@
 """Trade signal endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from app.db import get_db
+from app.limiter import limiter
 from app.models import CopiedTrade, TradeSignal
 from app.services import execution_service
 from app.services.signal_generator import WhaleEvent, process_whale_event
@@ -11,7 +12,8 @@ router = APIRouter()
 
 
 @router.get("/")
-def list_signals(limit: int = 50, status: str = None, db: Session = Depends(get_db)):
+@limiter.limit("200/minute")
+def list_signals(request: Request, limit: int = 50, status: str = None, db: Session = Depends(get_db)):
     """List recent trade signals."""
     q = db.query(TradeSignal).order_by(TradeSignal.created_at.desc())
     if status:
