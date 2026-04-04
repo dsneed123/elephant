@@ -232,6 +232,22 @@ class LeaderboardScraper:
 
         return round(min(1.0, raw) * 100.0, 2)
 
+    @staticmethod
+    def _seed_win_rate_prior(pnl: float, volume: float) -> float:
+        """Derive a bounded win_rate prior from leaderboard projected_pnl and volume.
+
+        Used when a new trader has no CopiedTrade history yet.  Returns 0.0 if
+        pnl is not positive; otherwise returns a value in [0.6, 0.85].
+
+        Formula: min(0.6 + pnl / (pnl + volume * 0.1), 0.85)
+
+        A high pnl-to-volume ratio pushes the estimate toward 0.85; a small
+        positive pnl relative to volume gives roughly 0.6.
+        """
+        if pnl <= 0:
+            return 0.0
+        return min(0.6 + pnl / (pnl + volume * 0.1), 0.85)
+
     def _assign_tier(self, rank: int) -> str:
         if rank <= 10:
             return "top_001"
@@ -267,27 +283,41 @@ class LeaderboardScraper:
         markets = data.get("markets_traded", 0)
 
         if trader is None:
+            # Seed win_rate and consistency from leaderboard data as a prior.
+            # These are replaced once real CopiedTrade history accumulates.
+            seeded_win_rate = self._seed_win_rate_prior(pnl, volume)
+            seeded_consistency = 0.5 if seeded_win_rate > 0.0 else 0.0
             trader = TrackedTrader(
                 kalshi_username=username,
                 display_name=data["nickname"],  # preserve original casing
                 total_profit=pnl,
-                win_rate=0.0,  # not available from leaderboard API
+                win_rate=seeded_win_rate,
                 total_trades=0,
                 avg_position_size=volume / max(markets, 1) if volume and markets else 0.0,
                 market_diversity=markets,
-                consistency_score=0.0,
+                consistency_score=seeded_consistency,
+                has_trade_history=False,
                 elephant_score=elephant_score,
                 tier=tier,
                 is_active=True,
                 last_seen=datetime.now(timezone.utc),
             )
             db.add(trader)
-            logger.debug("New trader: %s score=%.1f tier=%s", username, elephant_score, tier)
+            logger.debug(
+                "New trader: %s score=%.1f tier=%s seeded_win_rate=%.3f",
+                username, elephant_score, tier, seeded_win_rate,
+            )
         else:
             trader.display_name = data["nickname"]
             trader.total_profit = pnl if pnl else trader.total_profit
             trader.avg_position_size = volume / max(markets, 1) if volume and markets else trader.avg_position_size
             trader.market_diversity = markets if markets else trader.market_diversity
+            # Refresh the leaderboard-derived prior only while real history is absent.
+            if not trader.has_trade_history:
+                seeded_win_rate = self._seed_win_rate_prior(pnl, volume)
+                if seeded_win_rate > 0.0:
+                    trader.win_rate = seeded_win_rate
+                    trader.consistency_score = 0.5
             trader.elephant_score = elephant_score
             trader.tier = tier
             trader.is_active = True
@@ -458,6 +488,10 @@ def update_trader_stats_from_history(db: Session, trader: TrackedTrader) -> None
 
     if total_settled == 0:
         return
+
+    # Real trade history is now available; mark that seeded priors should not
+    # be refreshed from leaderboard data on future scrapes.
+    trader.has_trade_history = True
 
     pnl_values = [t.pnl for t in settled_trades]
     settled_wins = sum(1 for p in pnl_values if p > 0)

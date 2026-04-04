@@ -19,6 +19,7 @@ class TrackedTrader(Base):
     avg_position_size = Column(Float, default=0.0)
     market_diversity = Column(Integer, default=0)
     consistency_score = Column(Float, default=0.0)
+    has_trade_history = Column(Boolean, default=False)  # True once real CopiedTrade data replaces seeded priors
     elephant_score = Column(Float, default=0.0)  # Our composite ranking
     tier = Column(String, default="unranked")  # top_001, top_01, top_1, etc.
     top_markets = Column(Text, nullable=True)  # JSON list of market tickers this trader favors
