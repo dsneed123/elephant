@@ -111,6 +111,29 @@ def process_whale_event(event: WhaleEvent, db: Session) -> list[TradeSignal]:
             )
             continue
 
+        ttl_cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.signal_ttl_minutes)
+        duplicate = (
+            db.query(TradeSignal)
+            .filter(
+                TradeSignal.trader_id == trader.id,
+                TradeSignal.market_ticker == event.market_ticker,
+                TradeSignal.side == event.side,
+                TradeSignal.status.in_(["pending", "copied"]),
+                TradeSignal.created_at >= ttl_cutoff,
+            )
+            .first()
+        )
+        if duplicate:
+            logger.debug(
+                "Skipping duplicate signal for trader %s on %s/%s: existing signal %d (%s)",
+                trader.kalshi_username,
+                event.market_ticker,
+                event.side,
+                duplicate.id,
+                duplicate.status,
+            )
+            continue
+
         signal = TradeSignal(
             trader_id=trader.id,
             market_ticker=event.market_ticker,

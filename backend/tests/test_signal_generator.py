@@ -1,7 +1,7 @@
 """Tests for signal_generator._trader_tracks_market and process_whale_event."""
 
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -308,6 +308,7 @@ class TestExpireStaleSignals:
         assert fresh_signal.status == "pending"
 
     def test_non_pending_signal_is_not_expired(self, db):
+
         """Only 'pending' signals are targeted; copied/skipped signals are unchanged."""
         trader = _make_active_trader(db)
         old_copied = TradeSignal(
@@ -329,3 +330,104 @@ class TestExpireStaleSignals:
         db.refresh(old_copied)
         assert count == 0
         assert old_copied.status == "copied"
+
+
+# ---------------------------------------------------------------------------
+# process_whale_event — deduplication guard
+# ---------------------------------------------------------------------------
+
+
+class TestProcessWhaleEventDeduplication:
+    def _whale_event(self) -> WhaleEvent:
+        return WhaleEvent(
+            market_ticker="NASDAQ-24DEC31",
+            side="yes",
+            action="buy",
+            order_size=5000.0,
+            price=45.0,
+        )
+
+    def test_duplicate_pending_signal_is_skipped(self, db):
+        """A second event for the same trader/market/side does not create a new signal."""
+        trader = _make_active_trader(db)
+        event = self._whale_event()
+
+        with patch("app.main.scheduler", MagicMock()):
+            first = process_whale_event(event, db)
+        assert len(first) == 1
+
+        with patch("app.main.scheduler", MagicMock()):
+            second = process_whale_event(event, db)
+        assert len(second) == 0
+        assert db.query(TradeSignal).count() == 1
+
+    def test_duplicate_copied_signal_is_skipped(self, db):
+        """An existing 'copied' signal within the TTL window also blocks creation."""
+        trader = _make_active_trader(db)
+        existing = TradeSignal(
+            trader_id=trader.id,
+            market_ticker="NASDAQ-24DEC31",
+            side="yes",
+            action="buy",
+            detected_price=45.0,
+            confidence=0.70,
+            status="copied",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        )
+        db.add(existing)
+        db.commit()
+
+        event = self._whale_event()
+        with patch("app.main.scheduler", MagicMock()):
+            signals = process_whale_event(event, db)
+
+        assert signals == []
+        assert db.query(TradeSignal).count() == 1
+
+    def test_expired_signal_allows_new_creation(self, db):
+        """A signal older than signal_ttl_minutes does not block a new one."""
+        from app.config import settings
+
+        trader = _make_active_trader(db)
+        old = TradeSignal(
+            trader_id=trader.id,
+            market_ticker="NASDAQ-24DEC31",
+            side="yes",
+            action="buy",
+            detected_price=45.0,
+            confidence=0.70,
+            status="pending",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=settings.signal_ttl_minutes + 1),
+        )
+        db.add(old)
+        db.commit()
+
+        event = self._whale_event()
+        with patch("app.main.scheduler", MagicMock()):
+            signals = process_whale_event(event, db)
+
+        assert len(signals) == 1
+        assert db.query(TradeSignal).count() == 2
+
+    def test_different_side_creates_new_signal(self, db):
+        """A signal for a different side is not treated as a duplicate."""
+        trader = _make_active_trader(db)
+        existing = TradeSignal(
+            trader_id=trader.id,
+            market_ticker="NASDAQ-24DEC31",
+            side="no",
+            action="buy",
+            detected_price=45.0,
+            confidence=0.70,
+            status="pending",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        )
+        db.add(existing)
+        db.commit()
+
+        event = self._whale_event()  # side="yes"
+        with patch("app.main.scheduler", MagicMock()):
+            signals = process_whale_event(event, db)
+
+        assert len(signals) == 1
+        assert db.query(TradeSignal).count() == 2
