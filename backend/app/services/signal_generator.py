@@ -21,6 +21,7 @@ class WhaleEvent(BaseModel):
     action: str  # "buy" or "sell"
     order_size: float  # estimated order value in USD
     price: float  # price in cents (1–99) from the orderbook delta
+    market_title: str | None = None  # human-readable market title, if resolved
 
 
 def _compute_confidence(elephant_score: float, order_size: float) -> float:
@@ -105,6 +106,7 @@ def process_whale_event(event: WhaleEvent, db: Session) -> list[TradeSignal]:
         signal = TradeSignal(
             trader_id=trader.id,
             market_ticker=event.market_ticker,
+            market_title=event.market_title,
             side=event.side,
             action=event.action,
             detected_volume=event.order_size,

@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from app.config import settings
+from app.services.kalshi_client import get_kalshi_client
 from app.services.signal_generator import WhaleEvent, process_whale_event
 
 logger = logging.getLogger(__name__)
@@ -272,6 +273,15 @@ class OrderbookMonitor:
                     event.action,
                     event.order_size,
                 )
+
+                try:
+                    market_data = await get_kalshi_client().get_market(event.market_ticker)
+                    event.market_title = market_data.get("title")
+                except Exception:
+                    logger.warning(
+                        "Could not fetch market title for %s; market_title will be NULL",
+                        event.market_ticker,
+                    )
 
                 from app.db import SessionLocal
                 db = SessionLocal()
