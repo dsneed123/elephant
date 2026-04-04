@@ -5,9 +5,11 @@ import Traders from './pages/Traders'
 import Signals from './pages/Signals'
 import Trades from './pages/Trades'
 import Settings from './pages/Settings'
+import { WebSocketProvider } from './contexts/WebSocketContext'
 
 export default function App() {
   return (
+    <WebSocketProvider>
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<Layout />}>
@@ -20,5 +22,6 @@ export default function App() {
         </Route>
       </Routes>
     </BrowserRouter>
+    </WebSocketProvider>
   )
 }
