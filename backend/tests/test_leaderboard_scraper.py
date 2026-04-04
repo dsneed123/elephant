@@ -1082,3 +1082,132 @@ class TestScrapeFallbackIntegration:
             count = asyncio.run(scraper.scrape(db))
 
         assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# Trader deactivation logic
+# ---------------------------------------------------------------------------
+
+class TestTraderDeactivation:
+    def _make_trader(self, db, username, is_active=True, last_seen=None) -> TrackedTrader:
+        if last_seen is None:
+            last_seen = datetime.now(timezone.utc)
+        trader = TrackedTrader(
+            kalshi_username=username,
+            display_name=username,
+            win_rate=0.5,
+            consistency_score=0.5,
+            total_trades=0,
+            elephant_score=50.0,
+            tier="ranked",
+            is_active=is_active,
+            last_seen=last_seen,
+        )
+        db.add(trader)
+        db.flush()
+        return trader
+
+    def _run_scrape(self, scraper, db, merged):
+        with patch.object(scraper, "fetch_all_metrics", new=AsyncMock(return_value=merged)), \
+             patch.object(scraper, "is_rate_limited", return_value=False):
+            asyncio.run(scraper.scrape(db))
+
+    def test_stale_absent_trader_is_deactivated(self, scraper, db):
+        """A trader not in the leaderboard with last_seen > 3 days ago is deactivated."""
+        stale_last_seen = datetime.now(timezone.utc) - timedelta(days=4)
+        self._make_trader(db, "stale_trader", is_active=True, last_seen=stale_last_seen)
+        db.commit()
+
+        merged = {
+            "active_trader": {
+                "nickname": "active_trader",
+                "pnl": 1000.0,
+                "rank_pnl": 1,
+            }
+        }
+        self._run_scrape(scraper, db, merged)
+
+        stale = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "stale_trader"
+        ).first()
+        assert stale.is_active is False
+
+    def test_recently_absent_trader_is_not_deactivated(self, scraper, db):
+        """A trader absent from the leaderboard but last_seen within 3 days is kept active."""
+        recent_last_seen = datetime.now(timezone.utc) - timedelta(days=2)
+        self._make_trader(db, "recent_trader", is_active=True, last_seen=recent_last_seen)
+        db.commit()
+
+        merged = {
+            "other_trader": {
+                "nickname": "other_trader",
+                "pnl": 500.0,
+                "rank_pnl": 1,
+            }
+        }
+        self._run_scrape(scraper, db, merged)
+
+        recent = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "recent_trader"
+        ).first()
+        assert recent.is_active is True
+
+    def test_present_trader_stays_active(self, scraper, db):
+        """A trader returned by the leaderboard is never deactivated."""
+        stale_last_seen = datetime.now(timezone.utc) - timedelta(days=10)
+        self._make_trader(db, "present_trader", is_active=True, last_seen=stale_last_seen)
+        db.commit()
+
+        merged = {
+            "present_trader": {
+                "nickname": "present_trader",
+                "pnl": 2000.0,
+                "rank_pnl": 1,
+            }
+        }
+        self._run_scrape(scraper, db, merged)
+
+        trader = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "present_trader"
+        ).first()
+        assert trader.is_active is True
+
+    def test_already_inactive_trader_not_affected(self, scraper, db):
+        """A trader already inactive stays inactive (no double-deactivation side effects)."""
+        stale_last_seen = datetime.now(timezone.utc) - timedelta(days=10)
+        self._make_trader(db, "already_gone", is_active=False, last_seen=stale_last_seen)
+        db.commit()
+
+        merged = {
+            "some_trader": {
+                "nickname": "some_trader",
+                "pnl": 1000.0,
+                "rank_pnl": 1,
+            }
+        }
+        self._run_scrape(scraper, db, merged)
+
+        trader = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "already_gone"
+        ).first()
+        assert trader.is_active is False
+
+    def test_exactly_3_days_old_is_not_deactivated(self, scraper, db):
+        """A trader last seen just under 3 days ago is kept active (within the grace window)."""
+        boundary_last_seen = datetime.now(timezone.utc) - timedelta(days=2, hours=23)
+        self._make_trader(db, "boundary_trader", is_active=True, last_seen=boundary_last_seen)
+        db.commit()
+
+        merged = {
+            "other": {
+                "nickname": "other",
+                "pnl": 100.0,
+                "rank_pnl": 1,
+            }
+        }
+        self._run_scrape(scraper, db, merged)
+
+        trader = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "boundary_trader"
+        ).first()
+        assert trader.is_active is True

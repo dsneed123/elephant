@@ -568,6 +568,31 @@ class LeaderboardScraper:
         db.flush()
         await self._enrich_win_rate_from_settled_markets(db, merged)
         await self._enrich_with_top_markets(db, merged)
+
+        # Deactivate traders who no longer appear on the leaderboard.
+        # Require last_seen > 3 days ago to avoid false deactivations from
+        # transient API misses.
+        seen_usernames = {nick.lower() for nick in merged}
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+        stale_traders = (
+            db.query(TrackedTrader)
+            .filter(
+                TrackedTrader.is_active == True,  # noqa: E712
+                TrackedTrader.kalshi_username.notin_(seen_usernames),
+                TrackedTrader.last_seen < stale_cutoff,
+            )
+            .all()
+        )
+        for trader in stale_traders:
+            trader.is_active = False
+            logger.info(
+                "Deactivated trader %s (last_seen=%s, not in leaderboard)",
+                trader.kalshi_username,
+                trader.last_seen,
+            )
+        if stale_traders:
+            logger.info("Deactivated %d stale trader(s)", len(stale_traders))
+
         db.commit()
 
         elapsed_s = (datetime.utcnow() - started_at).total_seconds()
