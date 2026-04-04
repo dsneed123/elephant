@@ -5,6 +5,7 @@ import Traders from './pages/Traders'
 import Signals from './pages/Signals'
 import Trades from './pages/Trades'
 import Settings from './pages/Settings'
+import Portfolio from './pages/Portfolio'
 import { WebSocketProvider } from './contexts/WebSocketContext'
 
 export default function App() {
@@ -19,6 +20,7 @@ export default function App() {
           <Route path="signals" element={<Signals />} />
           <Route path="trades" element={<Trades />} />
           <Route path="settings" element={<Settings />} />
+          <Route path="portfolio" element={<Portfolio />} />
         </Route>
       </Routes>
     </BrowserRouter>
