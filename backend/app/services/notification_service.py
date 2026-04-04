@@ -73,6 +73,22 @@ def notify_stop_loss(trade) -> None:
     })
 
 
+def notify_trade_rejected(trade) -> None:
+    """Notify when a trade is cancelled due to a failed liquidity check."""
+    _post_webhook({
+        "embeds": [{
+            "title": "Trade Rejected — Liquidity Check Failed",
+            "color": 0xFFA500,
+            "fields": [
+                {"name": "Market", "value": trade.market_ticker, "inline": True},
+                {"name": "Side / Action", "value": f"{trade.side} / {trade.action}", "inline": True},
+                {"name": "Contracts", "value": str(trade.contracts), "inline": True},
+                {"name": "Reason", "value": trade.rejection_reason or "unknown", "inline": False},
+            ],
+        }]
+    })
+
+
 def notify_daily_loss_warning(daily_loss: float, portfolio_value: float) -> None:
     """Notify when daily loss exceeds 80% of max_daily_loss_pct."""
     loss_pct = daily_loss / portfolio_value if portfolio_value > 0 else 0.0

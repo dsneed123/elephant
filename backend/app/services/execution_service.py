@@ -27,6 +27,7 @@ def _trade_payload(trade: CopiedTrade) -> dict:
         "kalshi_order_id": trade.kalshi_order_id,
         "status": trade.status,
         "is_simulated": trade.is_simulated,
+        "rejection_reason": trade.rejection_reason,
         "pnl": trade.pnl,
         "created_at": trade.created_at.isoformat() if trade.created_at else None,
         "settled_at": trade.settled_at.isoformat() if trade.settled_at else None,
@@ -51,6 +52,69 @@ def _kelly_position_pct(win_rate: float, price: float, max_pct: float) -> float 
     if half_kelly <= 0:
         return None
     return min(half_kelly, max_pct)
+
+
+async def _check_liquidity(client, ticker: str, side: str, action: str, count: int) -> str | None:
+    """
+    Validate market liquidity before placing an order.
+
+    Fetches the current order book via ``client.get_orderbook()`` and enforces:
+      1. Available contracts on the ask side for the desired trade >= *count*.
+      2. Bid-ask spread < $0.10.
+
+    In Kalshi, YES and NO are complementary:
+    - Buying YES consumes NO-bid depth (counterparties selling YES by buying NO).
+    - Buying NO consumes YES-bid depth (counterparties selling NO by buying YES).
+    - Selling YES/NO uses the bid depth on the same side.
+
+    The bid-ask spread is computed from the YES perspective:
+      best_yes_ask = 1.00 − best_no_bid
+      spread       = best_yes_ask − best_yes_bid
+
+    Returns a human-readable rejection reason string if either guard fails, else None.
+    """
+    try:
+        data = await client.get_orderbook(ticker)
+    except Exception as exc:
+        logger.warning("Could not fetch orderbook for %s: %s — skipping liquidity check", ticker, exc)
+        return None
+
+    orderbook = data.get("orderbook", {})
+    # Each entry is [price_in_cents, quantity]; sorted descending by price.
+    yes_bids: list = orderbook.get("yes", [])
+    no_bids: list = orderbook.get("no", [])
+
+    # Guard 1: available ask-side depth for the desired trade.
+    if action == "buy":
+        # Buying YES is filled by NO-bid depth; buying NO by YES-bid depth.
+        available = sum(int(qty) for _, qty in (no_bids if side == "yes" else yes_bids))
+    else:
+        # Selling YES/NO is absorbed by same-side bid depth.
+        available = sum(int(qty) for _, qty in (yes_bids if side == "yes" else no_bids))
+
+    if available < count:
+        return (
+            f"insufficient liquidity: {available} contracts available "
+            f"(need {count}) on {'ask' if action == 'buy' else 'bid'} side "
+            f"for {side}"
+        )
+
+    # Guard 2: bid-ask spread (computed from YES perspective).
+    if not yes_bids or not no_bids:
+        return "orderbook is empty"
+
+    best_yes_bid = yes_bids[0][0] / 100.0   # highest YES bid in dollars
+    best_no_bid = no_bids[0][0] / 100.0     # highest NO bid in dollars
+    # Lowest YES ask = 1.00 - best_no_bid (complementary pricing)
+    spread = (1.0 - best_no_bid) - best_yes_bid
+
+    if spread >= 0.10:
+        return (
+            f"bid-ask spread ${spread:.2f} >= $0.10 limit "
+            f"(yes_bid={best_yes_bid:.2f}, no_bid={best_no_bid:.2f})"
+        )
+
+    return None
 
 
 def _check_risk_limits(db, signal: TradeSignal) -> str | None:
@@ -275,6 +339,7 @@ async def _execute_simulated(db, signal: TradeSignal, price_cents: int) -> None:
 
     max_spend = paper_balance * position_pct
     count = max(1, math.floor(max_spend / (price_cents / 100)))
+
     fake_order_id = f"sim-{uuid.uuid4().hex[:12]}"
     cost = count * (price_cents / 100)
 
@@ -338,6 +403,38 @@ async def _execute_real(db, signal: TradeSignal, price_cents: int) -> None:
 
     max_spend = balance * position_pct
     count = max(1, math.floor(max_spend / (price_cents / 100)))
+
+    # Liquidity check before placing the live order
+    liquidity_error = await _check_liquidity(
+        client, signal.market_ticker, signal.side, signal.action, count
+    )
+    if liquidity_error:
+        cost = count * (price_cents / 100)
+        cancelled = CopiedTrade(
+            signal_id=signal.id,
+            market_ticker=signal.market_ticker,
+            side=signal.side,
+            action=signal.action,
+            contracts=count,
+            price=price_cents / 100,
+            cost=cost,
+            status="cancelled",
+            is_simulated=False,
+            rejection_reason=liquidity_error,
+        )
+        db.add(cancelled)
+        signal.status = "skipped"
+        db.commit()
+        db.refresh(cancelled)
+        logger.warning(
+            "Signal %d cancelled by liquidity check: %s",
+            signal.id,
+            liquidity_error,
+        )
+        broadcast_event({"type": "trade_updated", "payload": _trade_payload(cancelled)})
+        from app.services.notification_service import notify_trade_rejected
+        notify_trade_rejected(cancelled)
+        return
 
     order = await client.place_order(
         ticker=signal.market_ticker,

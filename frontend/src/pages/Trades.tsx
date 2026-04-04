@@ -123,6 +123,14 @@ export default function Trades() {
                     >
                       {t.status}
                     </span>
+                    {t.status === 'cancelled' && t.rejection_reason && (
+                      <span
+                        className="block mt-1 text-[10px] text-orange-400/80 leading-tight max-w-[180px]"
+                        title={t.rejection_reason}
+                      >
+                        {t.rejection_reason}
+                      </span>
+                    )}
                   </td>
                   <td className="px-5 py-3 text-center">
                     <span

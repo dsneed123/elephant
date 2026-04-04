@@ -42,6 +42,7 @@ export interface CopiedTrade {
   status: 'pending' | 'filled' | 'partial' | 'cancelled' | 'settled' | 'simulated'
   is_simulated: boolean
   pnl: number | null
+  rejection_reason: string | null
   created_at: string
   settled_at: string | null
 }
