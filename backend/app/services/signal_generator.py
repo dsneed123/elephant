@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel
@@ -24,9 +25,16 @@ class WhaleEvent(BaseModel):
     market_title: str | None = None  # human-readable market title, if resolved
 
 
-def _compute_confidence(elephant_score: float, order_size: float) -> float:
-    """Compute signal confidence: base 0.5 + score component + size component, capped at 0.95."""
-    raw = 0.5 + (elephant_score / 100) * 0.3 + (order_size / 10_000) * 0.2
+def _compute_confidence(elephant_score: float, order_size: float, win_rate: float) -> float:
+    """Compute signal confidence from win rate, elephant score, and order size, capped at 0.95.
+
+    Components (sum to 1.0):
+      - win_rate                               weighted 40%
+      - elephant_score / 100                   weighted 35%
+      - log10(order_size) / log10(50_000)      weighted 25%
+    """
+    log_size = math.log10(max(order_size, 1)) / math.log10(50_000)
+    raw = win_rate * 0.40 + (elephant_score / 100) * 0.35 + log_size * 0.25
     return min(raw, 0.95)
 
 
@@ -91,7 +99,7 @@ def process_whale_event(event: WhaleEvent, db: Session) -> list[TradeSignal]:
         if not _trader_tracks_market(trader, event.market_ticker):
             continue
 
-        confidence = _compute_confidence(trader.elephant_score, event.order_size)
+        confidence = _compute_confidence(trader.elephant_score, event.order_size, trader.win_rate)
 
         if confidence < settings.min_signal_confidence:
             logger.debug(

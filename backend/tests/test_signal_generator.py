@@ -1,5 +1,6 @@
 """Tests for signal_generator._trader_tracks_market and process_whale_event."""
 
+import math
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,7 @@ from app.db import Base
 from app.models import TrackedTrader, TradeSignal
 from app.services.signal_generator import (
     WhaleEvent,
+    _compute_confidence,
     _trader_tracks_market,
     expire_stale_signals,
     process_whale_event,
@@ -74,11 +76,16 @@ def db():
     session.close()
 
 
-def _make_active_trader(db, elephant_score: float = 90.0, top_markets=None) -> TrackedTrader:
+def _make_active_trader(
+    db,
+    elephant_score: float = 90.0,
+    win_rate: float = 0.75,
+    top_markets=None,
+) -> TrackedTrader:
     trader = TrackedTrader(
         kalshi_username="whale_trader",
         elephant_score=elephant_score,
-        win_rate=0.75,
+        win_rate=win_rate,
         total_trades=50,
         is_active=True,
         top_markets=top_markets,
@@ -90,7 +97,7 @@ def _make_active_trader(db, elephant_score: float = 90.0, top_markets=None) -> T
 
 
 class TestProcessWhaleEventAutoExecution:
-    def _whale_event(self, order_size: float = 9000.0) -> WhaleEvent:
+    def _whale_event(self, order_size: float = 30_000.0) -> WhaleEvent:
         return WhaleEvent(
             market_ticker="NASDAQ-24DEC31",
             side="yes",
@@ -101,8 +108,10 @@ class TestProcessWhaleEventAutoExecution:
 
     def test_high_confidence_schedules_job(self, db):
         """High-confidence signal should be scheduled via scheduler.add_job, not asyncio."""
-        _make_active_trader(db, elephant_score=90.0)
-        event = self._whale_event(order_size=9000.0)
+        # win_rate=0.75, score=90, order=30_000 →
+        #   0.75*0.40 + 0.90*0.35 + (log10(30000)/log10(50000))*0.25 ≈ 0.853 > 0.85
+        _make_active_trader(db, elephant_score=90.0, win_rate=0.75)
+        event = self._whale_event(order_size=30_000.0)
 
         mock_scheduler = MagicMock()
         with patch("app.main.scheduler", mock_scheduler), \
@@ -117,7 +126,7 @@ class TestProcessWhaleEventAutoExecution:
 
     def test_low_confidence_does_not_schedule(self, db):
         """Low-confidence signal should not trigger scheduler.add_job."""
-        # elephant_score=10 + order_size=100 → confidence ~0.502, below auto_execute_threshold
+        # win_rate=0.75, score=10, order=100 → confidence ~0.44, below auto_execute_threshold
         _make_active_trader(db, elephant_score=10.0)
         event = self._whale_event(order_size=100.0)
 
@@ -151,10 +160,15 @@ class TestProcessWhaleEventCore:
 
     def test_matching_trader_creates_signal_with_correct_confidence(self, db):
         """A matching trader produces a signal whose confidence matches the formula."""
-        _make_active_trader(db, elephant_score=80.0)
+        _make_active_trader(db, elephant_score=80.0, win_rate=0.75)
         event = self._whale_event(order_size=5000.0)
-        # confidence = 0.5 + (80/100)*0.3 + (5000/10000)*0.2 = 0.84
-        expected_confidence = 0.5 + (80.0 / 100) * 0.3 + (5000.0 / 10_000) * 0.2
+        # confidence = 0.75*0.40 + (80/100)*0.35 + (log10(5000)/log10(50000))*0.25
+        import math as _math
+        expected_confidence = (
+            0.75 * 0.40
+            + (80.0 / 100) * 0.35
+            + (_math.log10(5000) / _math.log10(50_000)) * 0.25
+        )
 
         signals = process_whale_event(event, db)
 
@@ -166,9 +180,9 @@ class TestProcessWhaleEventCore:
 
     def test_confidence_capped_at_0_95(self, db):
         """Confidence is capped at 0.95 regardless of score and order size."""
-        _make_active_trader(db, elephant_score=100.0)
+        # win_rate=1.0, score=100, large order → raw > 0.95 → capped at 0.95
+        _make_active_trader(db, elephant_score=100.0, win_rate=1.0)
         event = self._whale_event(order_size=100_000.0)
-        # raw = 0.5 + 1.0*0.3 + 10.0*0.2 = 2.8 → capped at 0.95
 
         mock_scheduler = MagicMock()
         with patch("app.main.scheduler", mock_scheduler):
@@ -203,6 +217,43 @@ class TestProcessWhaleEventCore:
         signals = process_whale_event(event, db)
 
         assert signals == []
+
+
+# ---------------------------------------------------------------------------
+# _compute_confidence — unit tests for the confidence formula
+# ---------------------------------------------------------------------------
+
+
+class TestComputeConfidence:
+    def test_score50_small_order_cannot_reach_auto_execute_threshold(self):
+        """A score-50 trader with a $100 order cannot reach the 0.85 auto-execute threshold.
+
+        Even at perfect win_rate=1.0, the maximum achievable confidence for
+        elephant_score=50 and order_size=100 is well below 0.85.
+        """
+        # Worst case for the check: maximum win_rate
+        confidence = _compute_confidence(
+            elephant_score=50.0, order_size=100.0, win_rate=1.0
+        )
+        assert confidence < 0.85  # default auto_execute_threshold
+
+    def test_zero_order_size_does_not_crash(self):
+        """order_size=0 is handled gracefully via max(order_size, 1)."""
+        confidence = _compute_confidence(elephant_score=50.0, order_size=0.0, win_rate=0.5)
+        assert 0.0 <= confidence <= 0.95
+
+    def test_result_never_exceeds_cap(self):
+        """Confidence is always capped at 0.95."""
+        confidence = _compute_confidence(
+            elephant_score=100.0, order_size=1_000_000.0, win_rate=1.0
+        )
+        assert confidence == pytest.approx(0.95)
+
+    def test_components_weighted_correctly(self):
+        """Formula matches expected weighted components."""
+        score, size, wr = 60.0, 10_000.0, 0.6
+        expected = wr * 0.40 + (score / 100) * 0.35 + (math.log10(size) / math.log10(50_000)) * 0.25
+        assert _compute_confidence(score, size, wr) == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
