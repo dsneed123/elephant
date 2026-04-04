@@ -10,6 +10,7 @@ import {
 } from 'recharts'
 import { api } from '../api'
 import type { PortfolioPerformance, PortfolioSnapshot, TradeSignal } from '../types'
+import { useWebSocket } from '../contexts/WebSocketContext'
 
 function StatCard({
   label,
@@ -54,6 +55,7 @@ export default function Dashboard() {
   const [snapshots, setSnapshots] = useState<PortfolioSnapshot[]>([])
   const [signals, setSignals] = useState<TradeSignal[]>([])
   const [error, setError] = useState<string | null>(null)
+  const { latestEvent } = useWebSocket()
 
   useEffect(() => {
     Promise.all([
@@ -68,6 +70,17 @@ export default function Dashboard() {
       })
       .catch((e: Error) => setError(e.message))
   }, [])
+
+  useEffect(() => {
+    if (!latestEvent) return
+    if (latestEvent.type === 'signal_created') {
+      const sig = latestEvent.payload as TradeSignal
+      setSignals((prev) => [sig, ...prev].slice(0, 8))
+    } else if (latestEvent.type === 'portfolio_snapshot') {
+      const snap = latestEvent.payload as PortfolioSnapshot
+      setSnapshots((prev) => [...prev, snap])
+    }
+  }, [latestEvent])
 
   if (error) {
     return (

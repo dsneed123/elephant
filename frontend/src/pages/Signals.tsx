@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import type { TradeSignal } from '../types'
+import { useWebSocket } from '../contexts/WebSocketContext'
 
 type StatusFilter = 'all' | 'pending' | 'copied' | 'skipped' | 'expired' | 'dismissed'
 
@@ -19,6 +20,9 @@ export default function Signals() {
   const [error, setError] = useState<string | null>(null)
   const [actionLoading, setActionLoading] = useState<Record<number, 'execute' | 'dismiss'>>({})
   const [actionError, setActionError] = useState<Record<number, string>>({})
+  const { latestEvent } = useWebSocket()
+  const filterRef = useRef(filter)
+  filterRef.current = filter
 
   const load = (f: StatusFilter) => {
     setLoading(true)
@@ -37,11 +41,25 @@ export default function Signals() {
 
   useEffect(() => {
     load(filter)
-    // Poll every 15 seconds for new signals
-    const interval = setInterval(() => load(filter), 15_000)
-    return () => clearInterval(interval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter])
+
+  useEffect(() => {
+    if (!latestEvent) return
+    if (latestEvent.type === 'signal_created') {
+      const sig = latestEvent.payload as TradeSignal
+      setSignals((prev) => {
+        const f = filterRef.current
+        if (f !== 'all' && f !== sig.status) return prev
+        if (prev.some((s) => s.id === sig.id)) return prev
+        return [sig, ...prev]
+      })
+    } else if (latestEvent.type === 'trade_updated') {
+      // Reload to pick up any signal status changes driven by trade execution
+      load(filterRef.current)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latestEvent])
 
   const handleExecute = (id: number) => {
     setActionLoading((prev) => ({ ...prev, [id]: 'execute' }))
@@ -67,7 +85,7 @@ export default function Signals() {
     <div className="space-y-5">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-white">Trade Signals</h1>
-        <span className="text-xs text-zinc-500">Auto-refreshes every 15s</span>
+        <span className="text-xs text-zinc-500">Live updates via WebSocket</span>
       </div>
 
       {/* Status filter tabs */}
