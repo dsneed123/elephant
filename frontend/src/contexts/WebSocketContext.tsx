@@ -16,7 +16,7 @@ const WebSocketContext = createContext<WebSocketContextValue>({
 })
 
 const BASE_BACKOFF_MS = 1_000
-const MAX_BACKOFF_MS = 60_000
+const MAX_BACKOFF_MS = 30_000
 
 function getWsUrl(): string {
   const apiUrl = import.meta.env.VITE_API_URL as string | undefined
