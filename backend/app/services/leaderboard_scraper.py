@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
+from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
@@ -23,6 +24,7 @@ from app.models import CopiedTrade, TradeSignal, TrackedTrader
 logger = logging.getLogger(__name__)
 
 LEADERBOARD_API = "https://api.elections.kalshi.com/v1/social/leaderboard"
+KALSHI_LEADERBOARD_HTML = "https://kalshi.com/social/leaderboard"
 KALSHI_TRADE_API = "https://trading-api.kalshi.com/trade-api/v2"
 SCRAPE_MIN_INTERVAL_HOURS = 1
 
@@ -113,6 +115,62 @@ class LeaderboardScraper:
 
                 await asyncio.sleep(0.3)  # polite delay between requests
 
+        return merged
+
+    async def _scrape_html_fallback(self) -> dict[str, dict]:
+        """Fallback: parse the public Kalshi leaderboard HTML page.
+
+        Fetches https://kalshi.com/social/leaderboard and looks for trader
+        rows with data-username, data-profit (or data-pnl), and data-win-rate
+        attributes.  Returns the same merged dict format as fetch_all_metrics().
+        """
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+                resp = await client.get(KALSHI_LEADERBOARD_HTML)
+                resp.raise_for_status()
+                html = resp.text
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.error("HTML fallback fetch failed: %s", exc)
+            return {}
+
+        soup = BeautifulSoup(html, "html.parser")
+        merged: dict[str, dict] = {}
+
+        # Look for elements carrying a data-username attribute; each represents
+        # one trader row.  The page may also use data-pnl or data-profit for the
+        # PnL value, and data-win-rate or data-winrate for the win percentage.
+        rows = soup.find_all(attrs={"data-username": True})
+
+        for rank, row in enumerate(rows, start=1):
+            username = row.get("data-username", "").strip()
+            if not username:
+                continue
+
+            pnl_raw = row.get("data-profit") or row.get("data-pnl") or "0"
+            win_rate_raw = row.get("data-win-rate") or row.get("data-winrate") or "0"
+
+            try:
+                pnl = float(str(pnl_raw).replace(",", "").replace("$", ""))
+            except (ValueError, TypeError):
+                pnl = 0.0
+
+            try:
+                win_rate = float(str(win_rate_raw).replace("%", ""))
+                # Normalise: values like "65.5" → 0.655
+                if win_rate > 1.0:
+                    win_rate = win_rate / 100.0
+            except (ValueError, TypeError):
+                win_rate = 0.0
+
+            merged[username] = {
+                "nickname": username,
+                "profile_image": row.get("data-profile-image", ""),
+                "pnl": pnl,
+                "rank_pnl": rank,
+                "win_rate": win_rate,
+            }
+
+        logger.info("HTML fallback: parsed %d traders from leaderboard page", len(merged))
         return merged
 
     # ------------------------------------------------------------------ #
@@ -326,10 +384,18 @@ class LeaderboardScraper:
         logger.info("Starting Kalshi leaderboard API fetch")
         started_at = datetime.utcnow()
 
-        merged = await self.fetch_all_metrics()
+        try:
+            merged = await self.fetch_all_metrics()
+            if not merged:
+                raise ValueError("API returned 0 traders")
+        except Exception as exc:
+            logger.warning(
+                "Leaderboard API unavailable (%s); falling back to HTML scrape", exc
+            )
+            merged = await self._scrape_html_fallback()
 
         if not merged:
-            logger.warning("Leaderboard API returned 0 traders")
+            logger.warning("Leaderboard scrape returned 0 traders (API and HTML fallback both empty)")
             _last_scrape_time = datetime.utcnow()
             _last_scrape_count = 0
             return 0

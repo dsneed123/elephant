@@ -697,3 +697,162 @@ class TestEnrichWithTopMarkets:
             asyncio.run(scraper._enrich_with_top_markets(db, merged))
 
         mock_fetch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _scrape_html_fallback
+# ---------------------------------------------------------------------------
+
+class TestScrapeHtmlFallback:
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _html_with_traders(self, traders: list[dict]) -> str:
+        rows = ""
+        for t in traders:
+            attrs = f'data-username="{t["username"]}"'
+            if "profit" in t:
+                attrs += f' data-profit="{t["profit"]}"'
+            if "win_rate" in t:
+                attrs += f' data-win-rate="{t["win_rate"]}"'
+            if "profile_image" in t:
+                attrs += f' data-profile-image="{t["profile_image"]}"'
+            rows += f"<div {attrs}></div>\n"
+        return f"<html><body>{rows}</body></html>"
+
+    def _mock_html_client(self, html: str, status: int = 200):
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = status
+        resp.text = html
+        resp.raise_for_status = MagicMock()
+        if status >= 400:
+            resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "error", request=MagicMock(), response=resp
+            )
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        return client
+
+    def test_parses_trader_rows_with_data_attributes(self, scraper):
+        html = self._html_with_traders([
+            {"username": "alice", "profit": "5000.50", "win_rate": "65.0"},
+            {"username": "bob", "profit": "3000", "win_rate": "55.5"},
+        ])
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value = self._mock_html_client(html)
+            result = self._run(scraper._scrape_html_fallback())
+
+        assert "alice" in result
+        assert result["alice"]["pnl"] == pytest.approx(5000.50)
+        assert result["alice"]["win_rate"] == pytest.approx(0.65)
+        assert result["alice"]["rank_pnl"] == 1
+        assert "bob" in result
+        assert result["bob"]["rank_pnl"] == 2
+
+    def test_normalises_percentage_win_rate(self, scraper):
+        html = self._html_with_traders([
+            {"username": "trader1", "profit": "100", "win_rate": "72.3"},
+        ])
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value = self._mock_html_client(html)
+            result = self._run(scraper._scrape_html_fallback())
+
+        assert result["trader1"]["win_rate"] == pytest.approx(0.723)
+
+    def test_uses_data_pnl_fallback_attribute(self, scraper):
+        html = "<html><body><div data-username=\"x\" data-pnl=\"1234\"></div></body></html>"
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value = self._mock_html_client(html)
+            result = self._run(scraper._scrape_html_fallback())
+
+        assert result["x"]["pnl"] == pytest.approx(1234.0)
+
+    def test_skips_rows_without_username(self, scraper):
+        html = "<html><body><div data-profit=\"999\"></div></body></html>"
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value = self._mock_html_client(html)
+            result = self._run(scraper._scrape_html_fallback())
+
+        assert result == {}
+
+    def test_returns_empty_on_http_error(self, scraper):
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value = self._mock_html_client("", status=503)
+            result = self._run(scraper._scrape_html_fallback())
+
+        assert result == {}
+
+    def test_returns_empty_on_network_error(self, scraper):
+        client = AsyncMock()
+        client.get = AsyncMock(side_effect=httpx.RequestError("timeout"))
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value = client
+            result = self._run(scraper._scrape_html_fallback())
+
+        assert result == {}
+
+    def test_returns_empty_for_page_with_no_trader_rows(self, scraper):
+        html = "<html><body><p>No traders found</p></body></html>"
+        with patch("app.services.leaderboard_scraper.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value = self._mock_html_client(html)
+            result = self._run(scraper._scrape_html_fallback())
+
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# scrape() fallback integration
+# ---------------------------------------------------------------------------
+
+class TestScrapeFallbackIntegration:
+    def test_scrape_calls_html_fallback_when_api_returns_empty(self, scraper, db):
+        """When fetch_all_metrics() returns {}, scrape() should call _scrape_html_fallback()."""
+        fallback_data = {
+            "fallback_trader": {
+                "nickname": "fallback_trader",
+                "pnl": 2000.0,
+                "rank_pnl": 1,
+                "win_rate": 0.6,
+            }
+        }
+
+        with patch.object(scraper, "fetch_all_metrics", new=AsyncMock(return_value={})), \
+             patch.object(scraper, "_scrape_html_fallback", new=AsyncMock(return_value=fallback_data)), \
+             patch.object(scraper, "is_rate_limited", return_value=False):
+            count = asyncio.run(scraper.scrape(db))
+
+        assert count == 1
+        trader = db.query(TrackedTrader).filter(
+            TrackedTrader.kalshi_username == "fallback_trader"
+        ).first()
+        assert trader is not None
+
+    def test_scrape_calls_html_fallback_when_api_raises(self, scraper, db):
+        """When fetch_all_metrics() raises, scrape() should call _scrape_html_fallback()."""
+        fallback_data = {
+            "fb_trader": {
+                "nickname": "fb_trader",
+                "pnl": 1500.0,
+                "rank_pnl": 1,
+                "win_rate": 0.7,
+            }
+        }
+
+        with patch.object(scraper, "fetch_all_metrics", new=AsyncMock(side_effect=RuntimeError("API down"))), \
+             patch.object(scraper, "_scrape_html_fallback", new=AsyncMock(return_value=fallback_data)), \
+             patch.object(scraper, "is_rate_limited", return_value=False):
+            count = asyncio.run(scraper.scrape(db))
+
+        assert count == 1
+
+    def test_scrape_returns_zero_when_both_sources_empty(self, scraper, db):
+        with patch.object(scraper, "fetch_all_metrics", new=AsyncMock(return_value={})), \
+             patch.object(scraper, "_scrape_html_fallback", new=AsyncMock(return_value={})), \
+             patch.object(scraper, "is_rate_limited", return_value=False):
+            count = asyncio.run(scraper.scrape(db))
+
+        assert count == 0
