@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     max_per_trader_exposure_pct: float = 0.15  # Abort if open costs for a single trader exceed 15% of portfolio
     max_drawdown_pct: float = 0.25  # Block new trades if portfolio has dropped more than 25% from its 30-day peak
     stop_loss_pct: float = 0.20  # Close trade if unrealized loss exceeds 20% of entry cost
+    max_trades_per_market: int = 3  # Max concurrent open trades for a single market ticker
 
     # Paper trading / dry-run settings
     dry_run: bool = True  # When True, simulate orders instead of calling Kalshi API

@@ -85,6 +85,7 @@ class TestGetSettings:
             "whale_order_threshold",
             "paper_trading_mode",
             "paper_balance",
+            "max_trades_per_market",
         }
         assert expected_keys == set(data.keys())
 
@@ -148,3 +149,35 @@ class TestPatchSettings:
         )
         assert resp.status_code == 200
         assert live_settings.min_signal_confidence == new_confidence
+
+    def test_patch_max_trades_per_market(self, client):
+        resp = client.patch("/api/settings/", json={"max_trades_per_market": 5})
+        assert resp.status_code == 200
+        assert resp.json()["max_trades_per_market"] == 5
+
+    def test_rejects_zero_max_trades_per_market(self, client):
+        resp = client.patch("/api/settings/", json={"max_trades_per_market": 0})
+        assert resp.status_code == 422
+
+    def test_patch_max_trades_per_market_updates_live_settings(self, client):
+        resp = client.patch("/api/settings/", json={"max_trades_per_market": 7})
+        assert resp.status_code == 200
+        assert live_settings.max_trades_per_market == 7
+
+    def test_patch_max_per_trader_exposure_pct(self, client):
+        resp = client.patch("/api/settings/", json={"max_per_trader_exposure_pct": 0.12})
+        assert resp.status_code == 200
+        assert resp.json()["max_per_trader_exposure_pct"] == 0.12
+
+    def test_rejects_max_per_trader_exposure_pct_above_one(self, client):
+        resp = client.patch("/api/settings/", json={"max_per_trader_exposure_pct": 1.5})
+        assert resp.status_code == 422
+
+    def test_rejects_zero_max_per_trader_exposure_pct(self, client):
+        resp = client.patch("/api/settings/", json={"max_per_trader_exposure_pct": 0.0})
+        assert resp.status_code == 422
+
+    def test_patch_max_per_trader_exposure_pct_updates_live_settings(self, client):
+        resp = client.patch("/api/settings/", json={"max_per_trader_exposure_pct": 0.08})
+        assert resp.status_code == 200
+        assert live_settings.max_per_trader_exposure_pct == 0.08
