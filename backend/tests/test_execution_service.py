@@ -215,6 +215,7 @@ class TestExecuteSignal:
             mock_settings.max_total_exposure_pct = 0.30
             mock_settings.max_daily_loss_pct = 0.10
             mock_settings.max_per_trader_exposure_pct = 0.15
+            mock_settings.max_trades_per_market = 3
 
             _run(execution_service.execute_signal(signal.id))
 
@@ -241,6 +242,7 @@ class TestExecuteSignal:
             mock_settings.max_total_exposure_pct = 0.30
             mock_settings.max_daily_loss_pct = 0.10
             mock_settings.max_per_trader_exposure_pct = 0.15
+            mock_settings.max_trades_per_market = 3
 
             _run(execution_service.execute_signal(signal.id))
 
@@ -449,6 +451,7 @@ class TestRiskLimits:
         mock_settings.max_daily_loss_pct = 0.10
         mock_settings.max_per_trader_exposure_pct = 0.15
         mock_settings.max_drawdown_pct = 0.25
+        mock_settings.max_trades_per_market = 3
 
     def test_max_total_exposure_skips_signal(self, db):
         """Signal is skipped when open trade costs breach max_total_exposure_pct."""
@@ -1170,6 +1173,7 @@ class TestExecuteSignalIntegration:
         mock_settings.max_daily_loss_pct = 0.10
         mock_settings.max_per_trader_exposure_pct = 0.15
         mock_settings.max_drawdown_pct = 0.25
+        mock_settings.max_trades_per_market = 3
 
     def test_null_detected_price_is_skipped(self, db):
         """execute_signal returns early when detected_price is None; no trade is created."""

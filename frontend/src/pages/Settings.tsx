@@ -112,10 +112,23 @@ export default function Settings() {
               onChange={setNum('max_daily_loss_pct')}
             />
             <NumberField
+              label="Max Per-Trader Exposure"
+              description="Maximum fraction of portfolio in open trades for a single trader (e.g. 0.15 = 15%)"
+              value={form.max_per_trader_exposure_pct}
+              onChange={setNum('max_per_trader_exposure_pct')}
+            />
+            <NumberField
               label="Stop Loss"
               description="Close a trade if unrealized loss exceeds this fraction of entry cost (e.g. 0.20 = 20%)"
               value={form.stop_loss_pct}
               onChange={setNum('stop_loss_pct')}
+            />
+            <NumberField
+              label="Max Trades Per Market"
+              description="Maximum number of concurrent open trades for a single market ticker (e.g. 3)"
+              value={form.max_trades_per_market}
+              onChange={setNum('max_trades_per_market')}
+              step="1"
             />
           </div>
 

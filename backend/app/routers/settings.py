@@ -20,6 +20,7 @@ _LIVE_FIELD_MAP: dict[str, str] = {
     "whale_order_threshold": "whale_order_threshold",
     "paper_trading_mode": "dry_run",
     "paper_balance": "paper_balance_initial",
+    "max_trades_per_market": "max_trades_per_market",
 }
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class AppSettings(BaseModel):
     whale_order_threshold: float
     paper_trading_mode: bool
     paper_balance: float
+    max_trades_per_market: int = 3
 
 
 class SettingsPatch(BaseModel):
@@ -50,6 +52,7 @@ class SettingsPatch(BaseModel):
     whale_order_threshold: Optional[float] = None
     paper_trading_mode: Optional[bool] = None
     paper_balance: Optional[float] = None
+    max_trades_per_market: Optional[int] = None
 
     @field_validator(
         "max_exposure_pct", "max_daily_loss_pct", "max_per_trader_exposure_pct",
@@ -66,6 +69,13 @@ class SettingsPatch(BaseModel):
     def validate_positive(cls, v: Optional[float]) -> Optional[float]:
         if v is not None and v <= 0:
             raise ValueError("must be a positive number")
+        return v
+
+    @field_validator("max_trades_per_market")
+    @classmethod
+    def validate_max_trades_per_market(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError("must be at least 1")
         return v
 
 
@@ -88,6 +98,7 @@ def _load() -> AppSettings:
         whale_order_threshold=env_settings.whale_order_threshold,
         paper_trading_mode=env_settings.dry_run,
         paper_balance=env_settings.paper_balance_initial,
+        max_trades_per_market=env_settings.max_trades_per_market,
     )
 
 

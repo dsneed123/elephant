@@ -219,6 +219,27 @@ async def execute_signal(signal_id: int) -> None:
             logger.warning("Signal %d skipped by risk limit: %s", signal_id, risk_error)
             return
 
+        open_market_count = (
+            db.query(CopiedTrade)
+            .filter(
+                CopiedTrade.market_ticker == signal.market_ticker,
+                CopiedTrade.status.notin_(["settled", "cancelled"]),
+            )
+            .count()
+        )
+        if open_market_count >= settings.max_trades_per_market:
+            signal.status = "skipped"
+            db.commit()
+            logger.warning(
+                "Signal %d skipped: market %s already has %d open trade(s) "
+                "(limit=%d)",
+                signal_id,
+                signal.market_ticker,
+                open_market_count,
+                settings.max_trades_per_market,
+            )
+            return
+
         _maybe_notify_daily_loss_warning(db)
 
         if settings.dry_run:
