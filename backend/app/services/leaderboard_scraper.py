@@ -233,20 +233,27 @@ class LeaderboardScraper:
         return round(min(1.0, raw) * 100.0, 2)
 
     @staticmethod
-    def _seed_win_rate_prior(pnl: float, volume: float) -> float:
-        """Derive a bounded win_rate prior from leaderboard projected_pnl and volume.
+    def _seed_win_rate_prior(pnl: float, volume: float, markets_traded: int = 0) -> float:
+        """Bayesian shrinkage estimator: (wins + 2) / (total + 4).
 
-        Used when a new trader has no CopiedTrade history yet.  Returns 0.0 if
-        pnl is not positive; otherwise returns a value in [0.6, 0.85].
+        Uses projected_pnl relative to volume as a proxy for positive-PnL markets
+        to estimate the number of winning trades.  No hard floor (a 55% win rate
+        is valid) and no hard cap.
 
-        Formula: min(0.6 + pnl / (pnl + volume * 0.1), 0.85)
-
-        A high pnl-to-volume ratio pushes the estimate toward 0.85; a small
-        positive pnl relative to volume gives roughly 0.6.
+        Returns 0.0 when pnl is not positive.
         """
         if pnl <= 0:
             return 0.0
-        return min(0.6 + pnl / (pnl + volume * 0.1), 0.85)
+        total = max(markets_traded, 0)
+        if total == 0:
+            # No market-count data: pure Bayesian prior with no observations.
+            return (0 + 2) / (0 + 4)  # 0.5
+        if volume > 0:
+            win_fraction = min(1.0, 0.5 + pnl / (2.0 * volume))
+        else:
+            win_fraction = 1.0  # positive pnl, zero volume → treat as all wins
+        wins = round(total * win_fraction)
+        return (wins + 2) / (total + 4)
 
     def _assign_tier(self, rank: int) -> str:
         if rank <= 10:
@@ -285,7 +292,7 @@ class LeaderboardScraper:
         if trader is None:
             # Seed win_rate and consistency from leaderboard data as a prior.
             # These are replaced once real CopiedTrade history accumulates.
-            seeded_win_rate = self._seed_win_rate_prior(pnl, volume)
+            seeded_win_rate = self._seed_win_rate_prior(pnl, volume, markets)
             seeded_consistency = 0.5 if seeded_win_rate > 0.0 else 0.0
             trader = TrackedTrader(
                 kalshi_username=username,
@@ -314,7 +321,7 @@ class LeaderboardScraper:
             trader.market_diversity = markets if markets else trader.market_diversity
             # Refresh the leaderboard-derived prior only while real history is absent.
             if not trader.has_trade_history:
-                seeded_win_rate = self._seed_win_rate_prior(pnl, volume)
+                seeded_win_rate = self._seed_win_rate_prior(pnl, volume, markets)
                 if seeded_win_rate > 0.0:
                     trader.win_rate = seeded_win_rate
                     trader.consistency_score = 0.5
@@ -393,6 +400,119 @@ class LeaderboardScraper:
                 await asyncio.sleep(0.3)  # polite delay
 
     # ------------------------------------------------------------------ #
+    # Settled-market win-rate enrichment                                   #
+    # ------------------------------------------------------------------ #
+
+    async def _fetch_win_rate_from_settled_markets(
+        self,
+        client: httpx.AsyncClient,
+        username: str,
+        pnl: float,
+        volume: float,
+        markets_traded: int,
+    ) -> float:
+        """Estimate win rate from public settled-market data.
+
+        Fetches recently settled markets via GET /trade-api/v2/markets?status=settled,
+        then looks up the trader's portfolio to match trades against settled
+        outcomes.  Falls back to the Bayesian shrinkage prior when the portfolio
+        endpoint is unavailable (private profile) or returns no overlapping data.
+        """
+        # Step 1: fetch recently settled markets
+        try:
+            resp = await client.get(
+                f"{KALSHI_TRADE_API}/markets",
+                params={"status": "settled", "limit": 50},
+            )
+            resp.raise_for_status()
+            settled_markets = resp.json().get("markets", [])
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.debug("Settled markets fetch failed: %s", exc)
+            return self._seed_win_rate_prior(pnl, volume, markets_traded)
+
+        if not settled_markets:
+            return self._seed_win_rate_prior(pnl, volume, markets_traded)
+
+        # Step 2: fetch the trader's portfolio trades
+        try:
+            trades_resp = await client.get(
+                f"{KALSHI_TRADE_API}/portfolio/trades",
+                params={"user_id": username, "limit": 200},
+            )
+            if trades_resp.status_code == 403:
+                logger.debug("Portfolio private for %s; using Bayesian fallback", username)
+                return self._seed_win_rate_prior(pnl, volume, markets_traded)
+            trades_resp.raise_for_status()
+            portfolio_trades = trades_resp.json().get("trades", [])
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.debug("Portfolio fetch failed for %s: %s", username, exc)
+            return self._seed_win_rate_prior(pnl, volume, markets_traded)
+
+        if not portfolio_trades:
+            return self._seed_win_rate_prior(pnl, volume, markets_traded)
+
+        # Step 3: match portfolio trades to settled market outcomes
+        settled_results: dict[str, str] = {
+            m.get("ticker", ""): m.get("result", "")
+            for m in settled_markets
+            if m.get("ticker") and m.get("result")
+        }
+
+        wins = 0
+        total = 0
+        seen: set[str] = set()
+        for trade in portfolio_trades:
+            ticker = trade.get("ticker") or trade.get("market_ticker", "")
+            if not ticker or ticker in seen:
+                continue
+            result = settled_results.get(ticker)
+            if result is None:
+                continue
+            seen.add(ticker)
+            side = trade.get("side", "")
+            won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
+            wins += 1 if won else 0
+            total += 1
+
+        if total == 0:
+            return self._seed_win_rate_prior(pnl, volume, markets_traded)
+
+        logger.debug(
+            "Settled-market win rate for %s: %d/%d → %.3f",
+            username, wins, total, (wins + 2) / (total + 4),
+        )
+        return (wins + 2) / (total + 4)
+
+    async def _enrich_win_rate_from_settled_markets(
+        self, db: Session, merged: dict[str, dict]
+    ) -> None:
+        """Seed win_rate for cold-start traders using settled market history.
+
+        Skips traders that already have real CopiedTrade history
+        (has_trade_history=True), since update_trader_stats_from_history()
+        already owns their win_rate.
+        """
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            for nick, data in merged.items():
+                username = nick.lower()
+                trader = db.query(TrackedTrader).filter(
+                    TrackedTrader.kalshi_username == username
+                ).first()
+                if trader is None or trader.has_trade_history:
+                    continue
+                win_rate = await self._fetch_win_rate_from_settled_markets(
+                    client,
+                    username,
+                    data.get("pnl", 0.0),
+                    data.get("volume", 0.0),
+                    data.get("markets_traded", 0),
+                )
+                if win_rate > 0.0:
+                    trader.win_rate = win_rate
+                    trader.consistency_score = 0.5
+                await asyncio.sleep(0.3)
+
+    # ------------------------------------------------------------------ #
     # Public entry point                                                   #
     # ------------------------------------------------------------------ #
 
@@ -446,6 +566,7 @@ class LeaderboardScraper:
             count += 1
 
         db.flush()
+        await self._enrich_win_rate_from_settled_markets(db, merged)
         await self._enrich_with_top_markets(db, merged)
         db.commit()
 
