@@ -1,6 +1,7 @@
 """add dry-run columns to copied_trades
 
-Adds is_simulated flag and settled_at timestamp to support paper trading mode.
+Adds is_simulated flag to support paper trading mode.
+(settled_at was already added in the initial migration.)
 
 Revision ID: a1b2c3d4e5f6
 Revises: c3f7a2e5b891
@@ -21,18 +22,13 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Add is_simulated and settled_at columns to copied_trades."""
+    """Add is_simulated column to copied_trades for dry-run / paper trading mode."""
     op.add_column(
         'copied_trades',
         sa.Column('is_simulated', sa.Boolean(), nullable=False, server_default='0'),
     )
-    op.add_column(
-        'copied_trades',
-        sa.Column('settled_at', sa.DateTime(), nullable=True),
-    )
 
 
 def downgrade() -> None:
-    """Remove is_simulated and settled_at columns from copied_trades."""
-    op.drop_column('copied_trades', 'settled_at')
+    """Remove is_simulated column from copied_trades."""
     op.drop_column('copied_trades', 'is_simulated')

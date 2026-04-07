@@ -86,13 +86,20 @@ async def _snapshot_portfolio_job() -> None:
     try:
         if app_settings.dry_run:
             # Paper trading: compute paper balance from simulated trades only.
+            # stopped_out trades are closed with realised PnL — treat them like settled.
             all_simulated = (
                 db.query(CopiedTrade)
                 .filter(CopiedTrade.is_simulated.is_(True))
                 .all()
             )
-            open_trades = [t for t in all_simulated if t.status not in ("settled", "cancelled")]
-            settled_trades = [t for t in all_simulated if t.status == "settled" and t.pnl is not None]
+            open_trades = [
+                t for t in all_simulated
+                if t.status not in ("settled", "cancelled", "stopped_out")
+            ]
+            settled_trades = [
+                t for t in all_simulated
+                if t.pnl is not None and t.status in ("settled", "stopped_out")
+            ]
 
             total_pnl = sum(t.pnl for t in settled_trades)
             open_costs = sum(t.cost for t in open_trades)
@@ -107,7 +114,7 @@ async def _snapshot_portfolio_job() -> None:
                 db.query(CopiedTrade)
                 .filter(
                     CopiedTrade.is_simulated.is_(False),
-                    CopiedTrade.status.notin_(["settled", "cancelled"]),
+                    CopiedTrade.status.notin_(["settled", "cancelled", "stopped_out"]),
                 )
                 .all()
             )
@@ -117,7 +124,7 @@ async def _snapshot_portfolio_job() -> None:
                 db.query(CopiedTrade)
                 .filter(
                     CopiedTrade.is_simulated.is_(False),
-                    CopiedTrade.status == "settled",
+                    CopiedTrade.status.in_(["settled", "stopped_out"]),
                     CopiedTrade.pnl.isnot(None),
                 )
                 .all()

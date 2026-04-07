@@ -38,11 +38,16 @@ async def portfolio_performance(db: Session = Depends(get_db)):
             .all()
         )
         total_trades = len(all_simulated)
-        settled = [t for t in all_simulated if t.status == "settled" and t.pnl is not None]
-        winning = sum(1 for t in settled if t.pnl > 0)
-        total_pnl = sum(t.pnl for t in settled)
+        # stopped_out trades are closed with realised PnL — include them with settled
+        closed = [
+            t for t in all_simulated
+            if t.pnl is not None and t.status in ("settled", "stopped_out")
+        ]
+        winning = sum(1 for t in closed if t.pnl > 0)
+        total_pnl = sum(t.pnl for t in closed)
         open_costs = sum(
-            t.cost for t in all_simulated if t.status not in ("settled", "cancelled")
+            t.cost for t in all_simulated
+            if t.status not in ("settled", "cancelled", "stopped_out")
         )
         balance = settings.paper_balance_initial + total_pnl - open_costs
     else:
@@ -53,7 +58,7 @@ async def portfolio_performance(db: Session = Depends(get_db)):
         total_pnl = sum(
             t.pnl for t in db.query(CopiedTrade).filter(
                 CopiedTrade.is_simulated.is_(False),
-                CopiedTrade.status == "settled",
+                CopiedTrade.status.in_(["settled", "stopped_out"]),
             ).all()
             if t.pnl is not None
         )
