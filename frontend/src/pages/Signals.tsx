@@ -131,7 +131,16 @@ export default function Signals() {
     <div className="space-y-5">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-white">Trade Signals</h1>
-        <span className="text-xs text-zinc-500">Live updates via WebSocket</span>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => { load(filter); refreshPendingCount() }}
+            disabled={loading}
+            className="text-sm px-4 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed text-zinc-300 transition-colors"
+          >
+            {loading ? 'Refreshing…' : 'Refresh'}
+          </button>
+          <span className="text-xs text-zinc-500">Live updates via WebSocket</span>
+        </div>
       </div>
 
       {/* Status filter tabs + Execute All */}
