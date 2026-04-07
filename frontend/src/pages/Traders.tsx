@@ -3,6 +3,16 @@ import { api } from '../api'
 import type { TrackedTrader, TraderPnl } from '../types'
 import { useToast } from '../contexts/ToastContext'
 
+function timeAgo(iso: string): string {
+  const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000)
+  if (seconds < 60) return `${seconds}s ago`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.floor(hours / 24)}d ago`
+}
+
 const TIER_COLOR: Record<string, string> = {
   top_001: 'bg-yellow-500/20 text-yellow-300',
   top_01: 'bg-purple-500/20 text-purple-400',
@@ -163,6 +173,7 @@ export default function Traders() {
                 <th className="px-5 py-3 text-right">Trades</th>
                 <th className="px-5 py-3 text-right">Copied P&L</th>
                 <th className="px-5 py-3 text-right">ROI</th>
+                <th className="px-5 py-3 text-left">Last Active</th>
                 <th className="px-5 py-3 text-center">Active</th>
                 <th className="px-5 py-3 text-center">Enabled</th>
               </tr>
@@ -232,6 +243,9 @@ export default function Traders() {
                     ) : (
                       '—'
                     )}
+                  </td>
+                  <td className="px-5 py-3 text-zinc-500 text-xs" title={t.last_seen ? new Date(t.last_seen).toLocaleString() : undefined}>
+                    {t.last_seen ? timeAgo(t.last_seen) : '—'}
                   </td>
                   <td className="px-5 py-3 text-center">
                     <span
