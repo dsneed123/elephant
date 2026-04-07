@@ -853,6 +853,49 @@ class TestRiskLimits:
 
         sim.assert_awaited_once()
 
+    def test_stopped_out_trades_not_counted_in_exposure(self, db):
+        """Stopped-out trades are closed; their cost should not count toward open exposure."""
+        from app.services import execution_service
+        from app.models import PortfolioSnapshot
+        from datetime import datetime, timezone
+
+        trader = _make_trader(db)
+        signal = _make_signal(db, trader, price=40.0)
+
+        db.add(PortfolioSnapshot(
+            balance=1000.0, positions_value=0.0, total_value=1000.0, total_pnl=0.0,
+        ))
+        # Stopped-out trades with large original cost — if counted as open they would
+        # breach the 30% exposure limit ($300) and block the new signal.
+        for _ in range(4):
+            db.add(CopiedTrade(
+                signal_id=None,
+                market_ticker="STOPPED-MARKET",
+                side="yes",
+                action="buy",
+                contracts=100,
+                price=0.80,
+                cost=80.0,
+                kalshi_order_id="stopped-order",
+                status="stopped_out",
+                is_simulated=True,
+                pnl=-16.0,
+                settled_at=datetime.now(timezone.utc),
+            ))
+        db.commit()
+
+        factory, mock_db = self._make_db_factory(db)
+        sim = AsyncMock()
+
+        with patch.object(execution_service, "settings") as mock_settings, \
+             patch("app.db.SessionLocal", factory), \
+             patch.object(execution_service, "_execute_simulated", sim):
+            self._patch_settings(mock_settings)
+            _run(execution_service.execute_signal(signal.id))
+
+        # Stopped-out exposure is excluded → signal executes normally
+        sim.assert_awaited_once()
+
     def test_max_drawdown_ignores_snapshots_older_than_30_days(self, db):
         """Peak snapshots older than 30 days are excluded from the drawdown calculation."""
         from app.services import execution_service
