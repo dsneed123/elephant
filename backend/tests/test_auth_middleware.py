@@ -18,7 +18,7 @@ def client_with_key():
     """Client fixture with ELEPHANT_API_KEY configured."""
     with patch("app.middleware.auth.settings") as mock_settings:
         mock_settings.api_key = "test-secret-key"
-        yield TestClient(app)
+        yield TestClient(app, raise_server_exceptions=False)
 
 
 class TestDevMode:

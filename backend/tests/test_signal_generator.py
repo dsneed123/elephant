@@ -178,6 +178,22 @@ class TestProcessWhaleEventCore:
         assert signals[0].market_ticker == "NASDAQ-24DEC31"
         assert signals[0].side == "yes"
 
+    def test_detected_price_propagated_from_whale_event(self, db):
+        """signal.detected_price must equal event.price so auto-execution is not skipped."""
+        _make_active_trader(db, elephant_score=80.0, win_rate=0.75)
+        event = WhaleEvent(
+            market_ticker="NASDAQ-24DEC31",
+            side="yes",
+            action="buy",
+            order_size=5000.0,
+            price=62.0,
+        )
+
+        signals = process_whale_event(event, db)
+
+        assert len(signals) == 1
+        assert signals[0].detected_price == pytest.approx(62.0)
+
     def test_confidence_capped_at_0_95(self, db):
         """Confidence is capped at 0.95 regardless of score and order size."""
         # win_rate=1.0, score=100, large order → raw > 0.95 → capped at 0.95
