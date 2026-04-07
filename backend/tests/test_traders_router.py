@@ -1,5 +1,6 @@
 """Tests for PATCH /api/traders/{id} endpoint."""
 
+import json
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -83,3 +84,52 @@ class TestPatchTrader:
 
         db_session.refresh(trader)
         assert trader.is_enabled is False
+
+
+class TestPatchTraderMarkets:
+    def test_set_top_markets_stores_json(self, client, db_session):
+        """PATCH /{username}/markets stores a JSON list in top_markets."""
+        trader = _make_trader(db_session)
+
+        resp = client.patch(
+            f"/api/traders/{trader.kalshi_username}/markets",
+            json={"markets": ["TICK-1", "TICK-2", "TICK-3"]},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert json.loads(data["top_markets"]) == ["TICK-1", "TICK-2", "TICK-3"]
+
+    def test_set_top_markets_persists_to_db(self, client, db_session):
+        """Change is reflected in the database after PATCH."""
+        trader = _make_trader(db_session)
+
+        client.patch(
+            f"/api/traders/{trader.kalshi_username}/markets",
+            json={"markets": ["MKT-X"]},
+        )
+
+        db_session.refresh(trader)
+        assert json.loads(trader.top_markets) == ["MKT-X"]
+
+    def test_set_top_markets_empty_list(self, client, db_session):
+        """An empty markets list is accepted and stored."""
+        trader = _make_trader(db_session)
+
+        resp = client.patch(
+            f"/api/traders/{trader.kalshi_username}/markets",
+            json={"markets": []},
+        )
+
+        assert resp.status_code == 200
+        db_session.refresh(trader)
+        assert json.loads(trader.top_markets) == []
+
+    def test_set_top_markets_unknown_username_returns_404(self, client, db_session):
+        """PATCH on a non-existent username returns 404."""
+        resp = client.patch(
+            "/api/traders/no_such_user/markets",
+            json={"markets": ["MKT-1"]},
+        )
+
+        assert resp.status_code == 404
