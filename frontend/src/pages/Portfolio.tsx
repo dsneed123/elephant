@@ -9,7 +9,14 @@ import {
   CartesianGrid,
 } from 'recharts'
 import { api } from '../api'
-import type { PortfolioPerformance, PortfolioSnapshot, CopiedTrade } from '../types'
+import type { PortfolioPerformance, PortfolioSnapshot, CopiedTrade, TraderPnl } from '../types'
+
+const TIER_COLOR: Record<string, string> = {
+  top_001: 'bg-yellow-500/20 text-yellow-300',
+  top_01: 'bg-purple-500/20 text-purple-400',
+  top_1: 'bg-blue-500/20 text-blue-400',
+  top_10: 'bg-zinc-700 text-zinc-400',
+}
 
 function StatCard({
   label,
@@ -55,6 +62,7 @@ export default function Portfolio() {
   const [perf, setPerf] = useState<PortfolioPerformance | null>(null)
   const [snapshots, setSnapshots] = useState<PortfolioSnapshot[]>([])
   const [trades, setTrades] = useState<CopiedTrade[]>([])
+  const [traderPnl, setTraderPnl] = useState<TraderPnl[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -63,11 +71,13 @@ export default function Portfolio() {
       api.portfolio.performance(),
       api.portfolio.snapshots(100),
       api.portfolio.trades(50),
+      api.portfolio.traderPnl(),
     ])
-      .then(([p, s, t]) => {
+      .then(([p, s, t, tPnl]) => {
         setPerf(p)
         setSnapshots(s)
         setTrades(t)
+        setTraderPnl(tPnl.sort((a, b) => b.total_pnl - a.total_pnl))
         setLoading(false)
       })
       .catch((e: Error) => {
@@ -121,7 +131,7 @@ export default function Portfolio() {
         )}
       </div>
 
-      {/* Stat cards */}
+      {/* Core performance stats */}
       <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
         <StatCard
           label="Balance"
@@ -244,6 +254,77 @@ export default function Portfolio() {
         )}
       </div>
 
+      {/* Trader attribution */}
+      <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+        <div className="px-5 py-4 border-b border-zinc-800">
+          <h2 className="text-sm font-medium text-zinc-300">Copy Performance by Trader</h2>
+          <p className="text-xs text-zinc-600 mt-0.5">P&L attribution from copied trades</p>
+        </div>
+        {traderPnl.length === 0 ? (
+          <div className="px-5 py-8 text-center text-zinc-600 text-sm">
+            No copied trades yet — attribution appears here once trades are executed.
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-xs text-zinc-500 uppercase border-b border-zinc-800">
+                  <th className="px-5 py-3 text-left">Trader</th>
+                  <th className="px-5 py-3 text-left">Tier</th>
+                  <th className="px-5 py-3 text-right">Trades</th>
+                  <th className="px-5 py-3 text-right">Win Rate</th>
+                  <th className="px-5 py-3 text-right">Cost Basis</th>
+                  <th className="px-5 py-3 text-right">P&L</th>
+                  <th className="px-5 py-3 text-right">ROI</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800">
+                {traderPnl.map((t) => (
+                  <tr key={t.kalshi_username} className="hover:bg-zinc-800/50 transition-colors">
+                    <td className="px-5 py-3">
+                      <div className="font-medium text-zinc-200">{t.kalshi_username}</div>
+                      {t.display_name && (
+                        <div className="text-xs text-zinc-500">{t.display_name}</div>
+                      )}
+                    </td>
+                    <td className="px-5 py-3">
+                      <span
+                        className={`text-xs px-2 py-0.5 rounded-full ${
+                          TIER_COLOR[t.tier] ?? 'bg-zinc-700 text-zinc-400'
+                        }`}
+                      >
+                        {t.tier}
+                      </span>
+                    </td>
+                    <td className="px-5 py-3 text-right text-zinc-400">{t.trade_count}</td>
+                    <td className="px-5 py-3 text-right text-zinc-300">
+                      {(t.win_rate * 100).toFixed(1)}%
+                    </td>
+                    <td className="px-5 py-3 text-right font-mono text-zinc-400 text-xs">
+                      ${fmt(t.total_cost)}
+                    </td>
+                    <td
+                      className={`px-5 py-3 text-right font-mono text-xs font-semibold ${
+                        t.total_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                      }`}
+                    >
+                      {t.total_pnl >= 0 ? '+' : ''}${fmt(t.total_pnl)}
+                    </td>
+                    <td
+                      className={`px-5 py-3 text-right text-xs ${
+                        t.roi >= 0 ? 'text-emerald-400' : 'text-red-400'
+                      }`}
+                    >
+                      {(t.roi * 100).toFixed(1)}%
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
       {/* Recent trades table */}
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
         <div className="px-5 py-4 border-b border-zinc-800">
@@ -252,70 +333,72 @@ export default function Portfolio() {
         {trades.length === 0 ? (
           <div className="px-5 py-8 text-center text-zinc-600 text-sm">No trades yet.</div>
         ) : (
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-xs text-zinc-500 uppercase border-b border-zinc-800">
-                <th className="px-5 py-3 text-left">Market</th>
-                <th className="px-5 py-3 text-left">Side</th>
-                <th className="px-5 py-3 text-left">Action</th>
-                <th className="px-5 py-3 text-right">Contracts</th>
-                <th className="px-5 py-3 text-right">Price</th>
-                <th className="px-5 py-3 text-right">Cost</th>
-                <th className="px-5 py-3 text-right">P&L</th>
-                <th className="px-5 py-3 text-left">Status</th>
-                <th className="px-5 py-3 text-left">Date</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-zinc-800">
-              {trades.map((t) => (
-                <tr key={t.id} className="hover:bg-zinc-800/50 transition-colors">
-                  <td className="px-5 py-3 font-mono text-xs text-zinc-300">
-                    {t.market_ticker}
-                  </td>
-                  <td className="px-5 py-3">
-                    <span
-                      className={`text-xs font-semibold ${
-                        t.side === 'yes' ? 'text-emerald-400' : 'text-red-400'
-                      }`}
-                    >
-                      {t.side.toUpperCase()}
-                    </span>
-                  </td>
-                  <td className="px-5 py-3 text-zinc-300 uppercase text-xs font-medium">
-                    {t.action}
-                  </td>
-                  <td className="px-5 py-3 text-right text-zinc-300">{t.contracts}</td>
-                  <td className="px-5 py-3 text-right font-mono text-zinc-300 text-xs">
-                    ${t.price.toFixed(2)}
-                  </td>
-                  <td className="px-5 py-3 text-right font-mono text-zinc-400 text-xs">
-                    ${t.cost.toFixed(2)}
-                  </td>
-                  <td className="px-5 py-3 text-right font-mono text-xs">
-                    {t.pnl !== null ? (
-                      <span className={t.pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-                        {t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}
-                      </span>
-                    ) : (
-                      <span className="text-zinc-600">—</span>
-                    )}
-                  </td>
-                  <td className="px-5 py-3">
-                    <span
-                      className={`text-xs px-2 py-0.5 rounded-full ${
-                        STATUS_COLOR[t.status] ?? 'bg-zinc-700 text-zinc-400'
-                      }`}
-                    >
-                      {t.status}
-                    </span>
-                  </td>
-                  <td className="px-5 py-3 text-zinc-500 text-xs">
-                    {new Date(t.created_at).toLocaleString()}
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-xs text-zinc-500 uppercase border-b border-zinc-800">
+                  <th className="px-5 py-3 text-left">Market</th>
+                  <th className="px-5 py-3 text-left">Side</th>
+                  <th className="px-5 py-3 text-left">Action</th>
+                  <th className="px-5 py-3 text-right">Contracts</th>
+                  <th className="px-5 py-3 text-right">Price</th>
+                  <th className="px-5 py-3 text-right">Cost</th>
+                  <th className="px-5 py-3 text-right">P&L</th>
+                  <th className="px-5 py-3 text-left">Status</th>
+                  <th className="px-5 py-3 text-left">Date</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-zinc-800">
+                {trades.map((t) => (
+                  <tr key={t.id} className="hover:bg-zinc-800/50 transition-colors">
+                    <td className="px-5 py-3 font-mono text-xs text-zinc-300">
+                      {t.market_ticker}
+                    </td>
+                    <td className="px-5 py-3">
+                      <span
+                        className={`text-xs font-semibold ${
+                          t.side === 'yes' ? 'text-emerald-400' : 'text-red-400'
+                        }`}
+                      >
+                        {t.side.toUpperCase()}
+                      </span>
+                    </td>
+                    <td className="px-5 py-3 text-zinc-300 uppercase text-xs font-medium">
+                      {t.action}
+                    </td>
+                    <td className="px-5 py-3 text-right text-zinc-300">{t.contracts}</td>
+                    <td className="px-5 py-3 text-right font-mono text-zinc-300 text-xs">
+                      ${t.price.toFixed(2)}
+                    </td>
+                    <td className="px-5 py-3 text-right font-mono text-zinc-400 text-xs">
+                      ${t.cost.toFixed(2)}
+                    </td>
+                    <td className="px-5 py-3 text-right font-mono text-xs">
+                      {t.pnl !== null ? (
+                        <span className={t.pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                          {t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}
+                        </span>
+                      ) : (
+                        <span className="text-zinc-600">—</span>
+                      )}
+                    </td>
+                    <td className="px-5 py-3">
+                      <span
+                        className={`text-xs px-2 py-0.5 rounded-full ${
+                          STATUS_COLOR[t.status] ?? 'bg-zinc-700 text-zinc-400'
+                        }`}
+                      >
+                        {t.status}
+                      </span>
+                    </td>
+                    <td className="px-5 py-3 text-zinc-500 text-xs">
+                      {new Date(t.created_at).toLocaleString()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </div>

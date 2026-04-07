@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import type { TradeSignal } from '../types'
 import { useWebSocket } from '../contexts/WebSocketContext'
+import { useToast } from '../contexts/ToastContext'
 
 type StatusFilter = 'all' | 'pending' | 'copied' | 'skipped' | 'expired' | 'dismissed'
 
@@ -13,14 +14,26 @@ const STATUS_COLOR: Record<string, string> = {
   dismissed: 'bg-zinc-700 text-zinc-500',
 }
 
+function timeAgo(iso: string): string {
+  const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000)
+  if (seconds < 60) return `${seconds}s ago`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.floor(hours / 24)}d ago`
+}
+
 export default function Signals() {
   const [signals, setSignals] = useState<TradeSignal[]>([])
   const [filter, setFilter] = useState<StatusFilter>('all')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [actionLoading, setActionLoading] = useState<Record<number, 'execute' | 'dismiss'>>({})
-  const [actionError, setActionError] = useState<Record<number, string>>({})
+  const [executingAll, setExecutingAll] = useState(false)
+  const [pendingCount, setPendingCount] = useState(0)
   const { latestEvent } = useWebSocket()
+  const { push: toast } = useToast()
   const filterRef = useRef(filter)
   filterRef.current = filter
 
@@ -39,8 +52,13 @@ export default function Signals() {
       })
   }
 
+  const refreshPendingCount = () => {
+    api.signals.pending().then((sigs) => setPendingCount(sigs.length)).catch(() => {})
+  }
+
   useEffect(() => {
     load(filter)
+    refreshPendingCount()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter])
 
@@ -54,29 +72,57 @@ export default function Signals() {
         if (prev.some((s) => s.id === sig.id)) return prev
         return [sig, ...prev]
       })
+      if (sig.status === 'pending') setPendingCount((n) => n + 1)
     } else if (latestEvent.type === 'trade_updated') {
-      // Reload to pick up any signal status changes driven by trade execution
       load(filterRef.current)
+      refreshPendingCount()
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [latestEvent])
 
   const handleExecute = (id: number) => {
     setActionLoading((prev) => ({ ...prev, [id]: 'execute' }))
-    setActionError((prev) => { const next = { ...prev }; delete next[id]; return next })
     api.signals.execute(id)
-      .then(() => load(filter))
-      .catch((e: Error) => setActionError((prev) => ({ ...prev, [id]: e.message })))
+      .then(() => {
+        toast('success', 'Signal executed')
+        load(filter)
+        refreshPendingCount()
+      })
+      .catch((e: Error) => toast('error', `Execution failed: ${e.message}`))
       .finally(() => setActionLoading((prev) => { const next = { ...prev }; delete next[id]; return next }))
   }
 
   const handleDismiss = (id: number) => {
     setActionLoading((prev) => ({ ...prev, [id]: 'dismiss' }))
-    setActionError((prev) => { const next = { ...prev }; delete next[id]; return next })
     api.signals.dismiss(id)
-      .then(() => load(filter))
-      .catch((e: Error) => setActionError((prev) => ({ ...prev, [id]: e.message })))
+      .then(() => {
+        toast('info', 'Signal dismissed')
+        load(filter)
+        refreshPendingCount()
+      })
+      .catch((e: Error) => toast('error', `Dismiss failed: ${e.message}`))
       .finally(() => setActionLoading((prev) => { const next = { ...prev }; delete next[id]; return next }))
+  }
+
+  const handleExecuteAll = async () => {
+    const pending = signals.filter((s) => s.status === 'pending')
+    if (pending.length === 0) return
+    setExecutingAll(true)
+    let successCount = 0
+    let errorCount = 0
+    for (const sig of pending) {
+      try {
+        await api.signals.execute(sig.id)
+        successCount++
+      } catch {
+        errorCount++
+      }
+    }
+    if (successCount > 0) toast('success', `Executed ${successCount} signal${successCount > 1 ? 's' : ''}`)
+    if (errorCount > 0) toast('error', `${errorCount} signal${errorCount > 1 ? 's' : ''} failed to execute`)
+    load(filter)
+    refreshPendingCount()
+    setExecutingAll(false)
   }
 
   const tabs: StatusFilter[] = ['all', 'pending', 'copied', 'skipped', 'expired', 'dismissed']
@@ -88,21 +134,52 @@ export default function Signals() {
         <span className="text-xs text-zinc-500">Live updates via WebSocket</span>
       </div>
 
-      {/* Status filter tabs */}
-      <div className="flex gap-2">
+      {/* Status filter tabs + Execute All */}
+      <div className="flex items-center gap-2 flex-wrap">
         {tabs.map((t) => (
           <button
             key={t}
             onClick={() => setFilter(t)}
-            className={`text-xs px-3 py-1.5 rounded-md capitalize transition-colors ${
+            className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md capitalize transition-colors ${
               filter === t
                 ? 'bg-emerald-600 text-white'
                 : 'bg-zinc-800 text-zinc-400 hover:text-white'
             }`}
           >
             {t}
+            {t === 'pending' && pendingCount > 0 && (
+              <span
+                className={`text-xs font-bold rounded-full min-w-[1.1rem] h-4 flex items-center justify-center px-1 leading-none ${
+                  filter === 'pending'
+                    ? 'bg-white/20 text-white'
+                    : 'bg-amber-500 text-zinc-900'
+                }`}
+              >
+                {pendingCount > 99 ? '99+' : pendingCount}
+              </span>
+            )}
           </button>
         ))}
+
+        {pendingCount > 0 && (
+          <button
+            onClick={handleExecuteAll}
+            disabled={executingAll}
+            className="ml-auto flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors font-medium"
+          >
+            {executingAll ? (
+              <>
+                <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                </svg>
+                Executing…
+              </>
+            ) : (
+              `Execute All (${pendingCount})`
+            )}
+          </button>
+        )}
       </div>
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
@@ -115,6 +192,7 @@ export default function Signals() {
             No signals found.
           </div>
         ) : (
+          <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-xs text-zinc-500 uppercase border-b border-zinc-800">
@@ -131,7 +209,14 @@ export default function Signals() {
             </thead>
             <tbody className="divide-y divide-zinc-800">
               {signals.map((s) => (
-                <tr key={s.id} className="hover:bg-zinc-800/50 transition-colors">
+                <tr
+                  key={s.id}
+                  className={`transition-colors ${
+                    s.status === 'pending'
+                      ? 'bg-amber-500/5 hover:bg-amber-500/10'
+                      : 'hover:bg-zinc-800/50'
+                  }`}
+                >
                   <td className="px-5 py-3">
                     <div className="font-mono text-xs text-zinc-300">{s.market_ticker}</div>
                     {s.market_title && (
@@ -159,17 +244,31 @@ export default function Signals() {
                     {s.detected_volume.toLocaleString()}
                   </td>
                   <td className="px-5 py-3 text-right">
-                    <span
-                      className={
-                        s.confidence >= 0.85
-                          ? 'text-emerald-400'
-                          : s.confidence >= 0.7
-                          ? 'text-amber-400'
-                          : 'text-zinc-400'
-                      }
-                    >
-                      {(s.confidence * 100).toFixed(0)}%
-                    </span>
+                    <div className="flex flex-col items-end gap-1">
+                      <span
+                        className={`text-xs font-medium ${
+                          s.confidence >= 0.85
+                            ? 'text-emerald-400'
+                            : s.confidence >= 0.7
+                            ? 'text-amber-400'
+                            : 'text-zinc-400'
+                        }`}
+                      >
+                        {(s.confidence * 100).toFixed(0)}%
+                      </span>
+                      <div className="w-16 h-1 bg-zinc-700 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full rounded-full ${
+                            s.confidence >= 0.85
+                              ? 'bg-emerald-500'
+                              : s.confidence >= 0.7
+                              ? 'bg-amber-500'
+                              : 'bg-zinc-500'
+                          }`}
+                          style={{ width: `${(s.confidence * 100).toFixed(0)}%` }}
+                        />
+                      </div>
+                    </div>
                   </td>
                   <td className="px-5 py-3">
                     <span
@@ -180,29 +279,26 @@ export default function Signals() {
                       {s.status}
                     </span>
                   </td>
-                  <td className="px-5 py-3 text-zinc-500 text-xs">
-                    {new Date(s.created_at).toLocaleString()}
+                  <td className="px-5 py-3 text-zinc-500 text-xs" title={new Date(s.created_at).toLocaleString()}>
+                    {timeAgo(s.created_at)}
                   </td>
                   <td className="px-5 py-3">
                     {s.status === 'pending' && (
                       <div className="flex gap-2 items-center">
                         <button
                           onClick={() => handleExecute(s.id)}
-                          disabled={!!actionLoading[s.id]}
+                          disabled={!!actionLoading[s.id] || executingAll}
                           className="text-xs px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white transition-colors"
                         >
                           {actionLoading[s.id] === 'execute' ? '…' : 'Execute'}
                         </button>
                         <button
                           onClick={() => handleDismiss(s.id)}
-                          disabled={!!actionLoading[s.id]}
+                          disabled={!!actionLoading[s.id] || executingAll}
                           className="text-xs px-2.5 py-1 rounded bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 text-zinc-300 transition-colors"
                         >
                           {actionLoading[s.id] === 'dismiss' ? '…' : 'Dismiss'}
                         </button>
-                        {actionError[s.id] && (
-                          <span className="text-xs text-red-400">{actionError[s.id]}</span>
-                        )}
                       </div>
                     )}
                   </td>
@@ -210,6 +306,7 @@ export default function Signals() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { TrackedTrader, TraderPnl } from '../types'
+import { useToast } from '../contexts/ToastContext'
 
 const TIER_COLOR: Record<string, string> = {
   top_001: 'bg-yellow-500/20 text-yellow-300',
@@ -12,14 +13,15 @@ const TIER_COLOR: Record<string, string> = {
 type SortKey = 'elephant_score' | 'win_rate' | 'total_profit' | 'total_trades' | 'pnl'
 
 export default function Traders() {
+  const { push: toast } = useToast()
   const [traders, setTraders] = useState<TrackedTrader[]>([])
   const [pnlMap, setPnlMap] = useState<Record<string, TraderPnl>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('elephant_score')
   const [scraping, setScraping] = useState(false)
-  const [scrapeMsg, setScrapeMsg] = useState<string | null>(null)
   const [togglingId, setTogglingId] = useState<number | null>(null)
+  const [search, setSearch] = useState('')
 
   useEffect(() => {
     Promise.all([api.traders.list(), api.portfolio.traderPnl()])
@@ -36,7 +38,15 @@ export default function Traders() {
       })
   }, [])
 
-  const sorted = [...traders].sort((a, b) => {
+  const filtered = search.trim()
+    ? traders.filter(
+        (t) =>
+          t.kalshi_username.toLowerCase().includes(search.toLowerCase()) ||
+          (t.display_name ?? '').toLowerCase().includes(search.toLowerCase()),
+      )
+    : traders
+
+  const sorted = [...filtered].sort((a, b) => {
     if (sortKey === 'pnl') {
       const aPnl = pnlMap[a.kalshi_username]?.total_pnl ?? -Infinity
       const bPnl = pnlMap[b.kalshi_username]?.total_pnl ?? -Infinity
@@ -51,22 +61,22 @@ export default function Traders() {
       .patch(trader.id, { is_enabled: !trader.is_enabled })
       .then((updated) => {
         setTraders((prev) => prev.map((t) => (t.id === updated.id ? updated : t)))
+        toast('success', `${updated.kalshi_username} ${updated.is_enabled ? 'enabled' : 'disabled'}`)
       })
-      .catch((e: Error) => setScrapeMsg(`Error: ${e.message}`))
+      .catch((e: Error) => toast('error', e.message))
       .finally(() => setTogglingId(null))
   }
 
   const handleScrape = () => {
     setScraping(true)
-    setScrapeMsg(null)
     api.traders
       .scrape()
       .then((r) => {
-        setScrapeMsg(`Scraped ${r.scraped} traders`)
+        toast('success', `Scraped ${r.scraped} traders`)
         return api.traders.list()
       })
       .then(setTraders)
-      .catch((e: Error) => setScrapeMsg(`Error: ${e.message}`))
+      .catch((e: Error) => toast('error', e.message))
       .finally(() => setScraping(false))
   }
 
@@ -88,9 +98,6 @@ export default function Traders() {
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-white">Tracked Traders</h1>
         <div className="flex items-center gap-3">
-          {scrapeMsg && (
-            <span className="text-xs text-zinc-400">{scrapeMsg}</span>
-          )}
           <button
             onClick={handleScrape}
             disabled={scraping}
@@ -101,14 +108,36 @@ export default function Traders() {
         </div>
       </div>
 
-      {/* Sort controls */}
-      <div className="flex gap-2">
-        <span className="text-xs text-zinc-500 self-center">Sort by:</span>
-        <SortBtn k="elephant_score" label="Score" />
-        <SortBtn k="win_rate" label="Win Rate" />
-        <SortBtn k="total_profit" label="Profit" />
-        <SortBtn k="total_trades" label="Trades" />
-        <SortBtn k="pnl" label="P&L" />
+      {/* Toolbar */}
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="relative flex-1 min-w-[180px] max-w-xs">
+          <svg
+            className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500 pointer-events-none"
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <circle cx="11" cy="11" r="8" />
+            <path d="M21 21l-4.35-4.35" />
+          </svg>
+          <input
+            type="text"
+            placeholder="Search traders…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="w-full bg-zinc-800 border border-zinc-700 rounded-md pl-8 pr-3 py-1.5 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-500"
+          />
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-zinc-500">Sort by:</span>
+          <SortBtn k="elephant_score" label="Score" />
+          <SortBtn k="win_rate" label="Win Rate" />
+          <SortBtn k="total_profit" label="Profit" />
+          <SortBtn k="total_trades" label="Trades" />
+          <SortBtn k="pnl" label="P&L" />
+        </div>
       </div>
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
@@ -118,9 +147,10 @@ export default function Traders() {
           <div className="px-5 py-10 text-center text-red-400 text-sm">{error}</div>
         ) : sorted.length === 0 ? (
           <div className="px-5 py-10 text-center text-zinc-600 text-sm">
-            No traders yet. Click "Scrape Now" to fetch from Kalshi.
+            {search ? `No traders matching "${search}".` : 'No traders yet. Click "Scrape Now" to fetch from Kalshi.'}
           </div>
         ) : (
+          <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-xs text-zinc-500 uppercase border-b border-zinc-800">
@@ -230,6 +260,7 @@ export default function Traders() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>

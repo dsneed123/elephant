@@ -7,9 +7,11 @@ import Trades from './pages/Trades'
 import Settings from './pages/Settings'
 import Portfolio from './pages/Portfolio'
 import { WebSocketProvider } from './contexts/WebSocketContext'
+import { ToastProvider } from './contexts/ToastContext'
 
 export default function App() {
   return (
+    <ToastProvider>
     <WebSocketProvider>
     <BrowserRouter>
       <Routes>
@@ -25,5 +27,6 @@ export default function App() {
       </Routes>
     </BrowserRouter>
     </WebSocketProvider>
+    </ToastProvider>
   )
 }
