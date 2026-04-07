@@ -181,6 +181,46 @@ class TestExecuteSimulated:
         expected_contracts = max(1, math.floor(max_spend / (50 / 100)))
         assert trade.contracts == expected_contracts
 
+    def test_stopped_out_pnl_updates_paper_balance(self, db):
+        """Stopped-out trades are treated as closed: only the realised loss reduces balance."""
+        from app.services.execution_service import _execute_simulated
+        from app.config import settings
+        import math
+        from datetime import datetime, timezone
+
+        trader = _make_trader(db)
+
+        # A stopped_out trade: opened for $50, closed with a $10 loss.
+        # The position is no longer open so the $50 cost must NOT be deducted a second
+        # time; only the realised -$10 pnl should affect the balance.
+        stopped = CopiedTrade(
+            signal_id=None,
+            market_ticker="OLD-MARKET",
+            side="yes",
+            action="buy",
+            contracts=100,
+            price=0.50,
+            cost=50.0,
+            kalshi_order_id="sim-stopped",
+            status="stopped_out",
+            is_simulated=True,
+            pnl=-10.0,
+            settled_at=datetime.now(timezone.utc),
+        )
+        db.add(stopped)
+        db.commit()
+
+        signal = _make_signal(db, trader, price=50.0)
+        _run(_execute_simulated(db, signal, price_cents=50))
+
+        trade = db.query(CopiedTrade).filter_by(signal_id=signal.id).first()
+        assert trade is not None, "Trade should be created (position is closed)"
+        # Balance = initial + (-10) - 0 open costs = 990, not initial - 50 = 950
+        balance = settings.paper_balance_initial + (-10.0)
+        max_spend = balance * settings.max_position_pct
+        expected_contracts = max(1, math.floor(max_spend / 0.50))
+        assert trade.contracts == expected_contracts
+
 
 # ---------------------------------------------------------------------------
 # execute_signal — routing between dry-run and real

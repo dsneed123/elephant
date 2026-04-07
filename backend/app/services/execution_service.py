@@ -77,10 +77,10 @@ def _check_risk_limits(db, signal: TradeSignal) -> str | None:
     if portfolio_value <= 0:
         return None
 
-    # Guard 1: total open exposure
+    # Guard 1: total open exposure (stopped_out trades are already closed)
     open_trades = (
         db.query(CopiedTrade)
-        .filter(CopiedTrade.status.notin_(["settled", "cancelled"]))
+        .filter(CopiedTrade.status.notin_(["settled", "cancelled", "stopped_out"]))
         .all()
     )
     total_exposure = sum(t.cost for t in open_trades)
@@ -109,13 +109,13 @@ def _check_risk_limits(db, signal: TradeSignal) -> str | None:
             f"{settings.max_daily_loss_pct:.0%} limit ({loss_limit:.2f})"
         )
 
-    # Guard 3: per-trader exposure
+    # Guard 3: per-trader exposure (stopped_out trades are already closed)
     open_trader_trades = (
         db.query(CopiedTrade)
         .join(TradeSignal, CopiedTrade.signal_id == TradeSignal.id)
         .filter(
             TradeSignal.trader_id == signal.trader_id,
-            CopiedTrade.status.notin_(["settled", "cancelled"]),
+            CopiedTrade.status.notin_(["settled", "cancelled", "stopped_out"]),
         )
         .all()
     )
@@ -254,12 +254,14 @@ async def execute_signal(signal_id: int) -> None:
 
 async def _execute_simulated(db, signal: TradeSignal, price_cents: int) -> None:
     """Simulate order execution for dry-run / paper trading mode."""
-    # Compute available paper balance: initial + settled PnL - cost of open simulated trades
+    # Compute available paper balance: initial + settled PnL - cost of open simulated trades.
+    # "stopped_out" trades are closed (the loss is realised), so exclude them from open costs
+    # and include their PnL in the settled bucket.
     open_simulated = (
         db.query(CopiedTrade)
         .filter(
             CopiedTrade.is_simulated.is_(True),
-            CopiedTrade.status.notin_(["settled", "cancelled"]),
+            CopiedTrade.status.notin_(["settled", "cancelled", "stopped_out"]),
         )
         .all()
     )
@@ -267,7 +269,7 @@ async def _execute_simulated(db, signal: TradeSignal, price_cents: int) -> None:
         db.query(CopiedTrade)
         .filter(
             CopiedTrade.is_simulated.is_(True),
-            CopiedTrade.status == "settled",
+            CopiedTrade.status.in_(["settled", "stopped_out"]),
             CopiedTrade.pnl.isnot(None),
         )
         .all()
