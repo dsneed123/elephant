@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { CopiedTrade } from '../types'
+import { useWebSocket } from '../contexts/WebSocketContext'
+
+type StatusFilter = 'all' | 'pending' | 'filled' | 'partial' | 'cancelled' | 'settled' | 'simulated'
 
 const STATUS_COLOR: Record<string, string> = {
   pending: 'bg-amber-500/20 text-amber-400',
@@ -13,8 +16,10 @@ const STATUS_COLOR: Record<string, string> = {
 
 export default function Trades() {
   const [trades, setTrades] = useState<CopiedTrade[]>([])
+  const [filter, setFilter] = useState<StatusFilter>('all')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const { latestEvent } = useWebSocket()
 
   useEffect(() => {
     api.portfolio
@@ -29,9 +34,34 @@ export default function Trades() {
       })
   }, [])
 
+  useEffect(() => {
+    if (!latestEvent) return
+    if (latestEvent.type === 'trade_updated') {
+      const updated = latestEvent.payload as CopiedTrade
+      setTrades((prev) => {
+        const idx = prev.findIndex((t) => t.id === updated.id)
+        if (idx !== -1) {
+          const next = [...prev]
+          next[idx] = updated
+          return next
+        }
+        return [updated, ...prev]
+      })
+    }
+  }, [latestEvent])
+
+  const filtered = filter === 'all' ? trades : trades.filter((t) => t.status === filter)
+
+  const statusCounts = trades.reduce<Record<string, number>>((acc, t) => {
+    acc[t.status] = (acc[t.status] ?? 0) + 1
+    return acc
+  }, {})
+
   const totalPnl = trades.reduce((sum, t) => sum + (t.pnl ?? 0), 0)
   const settled = trades.filter((t) => t.status === 'settled')
   const wins = settled.filter((t) => (t.pnl ?? 0) > 0).length
+
+  const tabs: StatusFilter[] = ['all', 'pending', 'filled', 'partial', 'cancelled', 'settled', 'simulated']
 
   return (
     <div className="space-y-5">
@@ -55,17 +85,48 @@ export default function Trades() {
         </div>
       </div>
 
+      {/* Status filter tabs */}
+      <div className="flex gap-2 flex-wrap">
+        {tabs.map((t) => {
+          const count = t === 'all' ? trades.length : (statusCounts[t] ?? 0)
+          return (
+            <button
+              key={t}
+              onClick={() => setFilter(t)}
+              className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md capitalize transition-colors ${
+                filter === t
+                  ? 'bg-emerald-600 text-white'
+                  : 'bg-zinc-800 text-zinc-400 hover:text-white'
+              }`}
+            >
+              {t}
+              {count > 0 && (
+                <span
+                  className={`text-xs font-bold rounded-full min-w-[1.1rem] h-4 flex items-center justify-center px-1 leading-none ${
+                    filter === t ? 'bg-white/20 text-white' : 'bg-zinc-700 text-zinc-300'
+                  }`}
+                >
+                  {count}
+                </span>
+              )}
+            </button>
+          )
+        })}
+      </div>
+
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
         {loading ? (
           <div className="px-5 py-10 text-center text-zinc-500 text-sm">Loading…</div>
         ) : error ? (
           <div className="px-5 py-10 text-center text-red-400 text-sm">{error}</div>
-        ) : trades.length === 0 ? (
+        ) : filtered.length === 0 ? (
           <div className="px-5 py-10 text-center text-zinc-600 text-sm">
-            No trades yet. Trades are executed when signals are generated and confidence
-            exceeds the auto-execute threshold.
+            {filter === 'all'
+              ? 'No trades yet. Trades are executed when signals are generated and confidence exceeds the threshold.'
+              : `No ${filter} trades.`}
           </div>
         ) : (
+          <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-xs text-zinc-500 uppercase border-b border-zinc-800">
@@ -77,12 +138,12 @@ export default function Trades() {
                 <th className="px-5 py-3 text-right">Cost</th>
                 <th className="px-5 py-3 text-right">P&L</th>
                 <th className="px-5 py-3 text-left">Status</th>
-                <th className="px-5 py-3 text-center">Sim</th>
+                <th className="px-5 py-3 text-left">Mode</th>
                 <th className="px-5 py-3 text-left">Date</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800">
-              {trades.map((t) => (
+              {filtered.map((t) => (
                 <tr key={t.id} className="hover:bg-zinc-800/50 transition-colors">
                   <td className="px-5 py-3 font-mono text-xs text-zinc-300">
                     {t.market_ticker}
@@ -124,13 +185,16 @@ export default function Trades() {
                       {t.status}
                     </span>
                   </td>
-                  <td className="px-5 py-3 text-center">
+                  <td className="px-5 py-3">
                     <span
-                      className={`inline-block w-2 h-2 rounded-full ${
-                        t.is_simulated ? 'bg-amber-400' : 'bg-emerald-400'
+                      className={`text-xs px-1.5 py-0.5 rounded ${
+                        t.is_simulated
+                          ? 'bg-amber-500/20 text-amber-400'
+                          : 'bg-emerald-500/20 text-emerald-400'
                       }`}
-                      title={t.is_simulated ? 'Simulated' : 'Live'}
-                    />
+                    >
+                      {t.is_simulated ? 'Paper' : 'Live'}
+                    </span>
                   </td>
                   <td className="px-5 py-3 text-zinc-500 text-xs">
                     {new Date(t.created_at).toLocaleString()}
@@ -139,6 +203,7 @@ export default function Trades() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>
