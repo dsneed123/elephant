@@ -240,6 +240,106 @@ def _add_snapshot(db, total_pnl, total_value, balance=1000.0, positions_value=0.
     return snap
 
 
+class TestPerformancePaperMode:
+    """Tests for GET /api/portfolio/performance in dry-run (paper trading) mode."""
+
+    def test_stopped_out_pnl_included_in_total_pnl(self, client, db_session):
+        """Stopped-out trades' realised loss counts toward total_pnl, not open_costs."""
+        from datetime import datetime, timezone
+        from app.models import CopiedTrade
+
+        # A stopped-out trade: cost=$50, pnl=-$10
+        stopped = CopiedTrade(
+            signal_id=None,
+            market_ticker="STOP-MKT",
+            side="yes",
+            action="buy",
+            contracts=100,
+            price=0.50,
+            cost=50.0,
+            kalshi_order_id="sim-stopped",
+            status="stopped_out",
+            is_simulated=True,
+            pnl=-10.0,
+            settled_at=datetime.now(timezone.utc),
+        )
+        db_session.add(stopped)
+        db_session.commit()
+
+        from unittest.mock import patch
+        from app.config import Settings
+
+        fake_settings = Settings(
+            kalshi_api_key="x",
+            kalshi_private_key_path="/dev/null",
+            dry_run=True,
+            paper_balance_initial=1000.0,
+        )
+        with patch("app.routers.portfolio.settings", fake_settings):
+            resp = client.get("/api/portfolio/performance")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "paper"
+        # total_pnl should reflect the stopped_out loss
+        assert data["total_pnl"] == pytest.approx(-10.0)
+        # balance = 1000 + (-10) - 0 open costs = 990
+        assert data["balance"] == pytest.approx(990.0)
+
+    def test_stopped_out_not_counted_in_open_costs(self, client, db_session):
+        """Stopped-out cost must not be deducted from the paper balance a second time."""
+        from datetime import datetime, timezone
+        from app.models import CopiedTrade
+
+        stopped = CopiedTrade(
+            signal_id=None,
+            market_ticker="STOP-MKT",
+            side="yes",
+            action="buy",
+            contracts=100,
+            price=0.50,
+            cost=50.0,
+            kalshi_order_id="sim-stopped2",
+            status="stopped_out",
+            is_simulated=True,
+            pnl=-10.0,
+            settled_at=datetime.now(timezone.utc),
+        )
+        # An open (not yet closed) trade
+        open_trade = CopiedTrade(
+            signal_id=None,
+            market_ticker="OPEN-MKT",
+            side="yes",
+            action="buy",
+            contracts=20,
+            price=0.50,
+            cost=10.0,
+            kalshi_order_id="sim-open",
+            status="simulated",
+            is_simulated=True,
+        )
+        db_session.add(stopped)
+        db_session.add(open_trade)
+        db_session.commit()
+
+        from unittest.mock import patch
+        from app.config import Settings
+
+        fake_settings = Settings(
+            kalshi_api_key="x",
+            kalshi_private_key_path="/dev/null",
+            dry_run=True,
+            paper_balance_initial=1000.0,
+        )
+        with patch("app.routers.portfolio.settings", fake_settings):
+            resp = client.get("/api/portfolio/performance")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        # balance = 1000 + (-10) pnl - 10 open cost = 980
+        assert data["balance"] == pytest.approx(980.0)
+
+
 class TestPerformanceRiskMetrics:
     def test_no_snapshots_returns_null_metrics(self, client):
         resp = client.get("/api/portfolio/performance")
