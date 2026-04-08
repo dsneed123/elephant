@@ -345,7 +345,12 @@ class TestScan:
 
         assert len(signals_with_weekly) == 1
         assert signals_with_weekly[0].direction == "LONG"
-        assert signals_with_weekly[0].strength == max(
+        # The penalty reduces strength. The S/R bonus (+5) is applied after the penalty,
+        # so the net reduction from without-weekly may be less than AGAINST_TREND_PENALTY
+        # (e.g. when without-weekly is capped at 100). Verify strength is reduced and the
+        # opposed reason is present.
+        assert signals_with_weekly[0].strength < signals_without_weekly[0].strength
+        assert signals_with_weekly[0].strength >= max(
             0, signals_without_weekly[0].strength - AGAINST_TREND_PENALTY
         )
         assert any("opposed" in r for r in signals_with_weekly[0].reasons)
