@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     webhook_url: str = ""  # Discord-compatible webhook URL; empty disables notifications
     webhook_enabled: bool = False  # Set True to enable webhook notifications
 
+    # Stock watchlist for pre-market gap scanning and earnings calendar awareness
+    # Set via env var as JSON array: WATCHLIST_SYMBOLS='["AAPL","TSLA","NVDA"]'
+    watchlist_symbols: list[str] = []
+
     # API key authentication (ELEPHANT_API_KEY); None disables auth (dev mode)
     api_key: Optional[str] = None
 

@@ -80,6 +80,40 @@ async def _check_stop_losses_job() -> None:
         db.close()
 
 
+async def _premarket_gap_scan_job() -> None:
+    """APScheduler wrapper: scan watchlist for pre-market gaps before market open."""
+    if not app_settings.watchlist_symbols:
+        return
+    from lib.stock_scanner import check_premarket_gaps
+    from app.services.notification_service import notify_gap_alerts
+    try:
+        gaps = check_premarket_gaps(app_settings.watchlist_symbols)
+        if gaps:
+            logger.info("Pre-market gap scan: %d gap(s) detected", len(gaps))
+            notify_gap_alerts(gaps)
+        else:
+            logger.info("Pre-market gap scan: no significant gaps")
+    except Exception:
+        logger.exception("_premarket_gap_scan_job failed")
+
+
+async def _earnings_watch_job() -> None:
+    """APScheduler wrapper: post weekly earnings watch embed on Monday mornings."""
+    if not app_settings.watchlist_symbols:
+        return
+    from lib.stock_scanner import get_earnings_this_week
+    from app.services.notification_service import notify_earnings_watch
+    try:
+        earnings = get_earnings_this_week(app_settings.watchlist_symbols)
+        logger.info(
+            "Earnings watch: %d watchlist stock(s) reporting this week",
+            len(earnings),
+        )
+        notify_earnings_watch(earnings)
+    except Exception:
+        logger.exception("_earnings_watch_job failed")
+
+
 async def _snapshot_portfolio_job() -> None:
     """APScheduler wrapper: capture a portfolio snapshot every 30 minutes."""
     db = SessionLocal()
@@ -211,12 +245,33 @@ async def lifespan(app: FastAPI):
         id="portfolio_snapshot",
         replace_existing=True,
     )
+    # Pre-market gap scan at 09:00 on weekdays (before 09:30 market open)
+    scheduler.add_job(
+        _premarket_gap_scan_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=9,
+        minute=0,
+        id="premarket_gap_scan",
+        replace_existing=True,
+    )
+    # Weekly earnings watch every Monday at 08:00
+    scheduler.add_job(
+        _earnings_watch_job,
+        trigger="cron",
+        day_of_week="mon",
+        hour=8,
+        minute=0,
+        id="earnings_watch",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info(
         "APScheduler started — leaderboard scrape every 6 hours, "
         "order fill poll every 2 minutes, signal expiry every 5 minutes, "
         "stop-loss check every 5 minutes, trade settlement every 15 minutes, "
-        "portfolio snapshot every 30 minutes"
+        "portfolio snapshot every 30 minutes, "
+        "pre-market gap scan weekdays at 09:00, earnings watch Mondays at 08:00"
     )
     if app_settings.dry_run:
         logger.warning(

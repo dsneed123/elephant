@@ -1,5 +1,8 @@
 """Tests for lib/stock_scanner multi-timeframe confirmation logic."""
 
+import datetime
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from lib.stock_scanner import (
@@ -7,13 +10,18 @@ from lib.stock_scanner import (
     TREND_ALIGNMENT_BONUS,
     WEEKLY_TREND_PENALTY,
     Direction,
+    GapAlert,
     SwingSignal,
     _detect_rsi_divergence,
+    _get_next_earnings_date,
     _near_support_resistance,
     _rsi,
     _sma,
     _trend_from_sma,
     apply_multi_timeframe_filters,
+    check_premarket_gaps,
+    get_earnings_this_week,
+    has_earnings_within_days,
 )
 
 
@@ -419,3 +427,189 @@ class TestApplyMultiTimeframeFilters:
         assert isinstance(result, SwingSignal)
         assert result.symbol == "TEST"
         assert result.direction == Direction.LONG
+
+    def test_earnings_within_2_days_excluded(self):
+        """earnings_excluded=True and note added when earnings are within 2 days."""
+        daily = _flat_bars(100.0, 60)
+        weekly = _flat_bars(100.0, 60)
+        today = datetime.date.today()
+        earnings_tomorrow = today + datetime.timedelta(days=1)
+        sig = apply_multi_timeframe_filters(
+            symbol="AAPL",
+            direction=Direction.LONG,
+            base_strength=50.0,
+            daily_bars=daily,
+            weekly_bars=weekly,
+            four_hour_bars=self._four_hour_bars(),
+            current_price=200.0,
+            earnings_date=earnings_tomorrow,
+        )
+        assert sig.earnings_excluded is True
+        assert sig.earnings_date == earnings_tomorrow
+        assert any("EARNINGS" in n for n in sig.notes)
+        assert any("excluded" in n for n in sig.notes)
+
+    def test_earnings_within_week_warns_but_not_excluded(self):
+        """earnings_excluded=False but warning note added when earnings are 3-7 days out."""
+        daily = _flat_bars(100.0, 60)
+        weekly = _flat_bars(100.0, 60)
+        today = datetime.date.today()
+        earnings_in_5_days = today + datetime.timedelta(days=5)
+        sig = apply_multi_timeframe_filters(
+            symbol="MSFT",
+            direction=Direction.LONG,
+            base_strength=50.0,
+            daily_bars=daily,
+            weekly_bars=weekly,
+            four_hour_bars=self._four_hour_bars(),
+            current_price=200.0,
+            earnings_date=earnings_in_5_days,
+        )
+        assert sig.earnings_excluded is False
+        assert sig.earnings_date == earnings_in_5_days
+        assert any("EARNINGS" in n for n in sig.notes)
+        assert not any("excluded" in n for n in sig.notes)
+
+    def test_no_earnings_date_no_note(self):
+        """No earnings note when earnings_date is None."""
+        daily = _flat_bars(100.0, 60)
+        weekly = _flat_bars(100.0, 60)
+        sig = apply_multi_timeframe_filters(
+            symbol="NVDA",
+            direction=Direction.LONG,
+            base_strength=50.0,
+            daily_bars=daily,
+            weekly_bars=weekly,
+            four_hour_bars=self._four_hour_bars(),
+            current_price=200.0,
+            earnings_date=None,
+        )
+        assert sig.earnings_excluded is False
+        assert sig.earnings_date is None
+        assert not any("EARNINGS" in n for n in sig.notes)
+
+
+# ---------------------------------------------------------------------------
+# check_premarket_gaps
+# ---------------------------------------------------------------------------
+
+
+class TestCheckPremarketGaps:
+    def _make_fast_info(self, pre_market_price, previous_close):
+        fi = MagicMock()
+        fi.pre_market_price = pre_market_price
+        fi.previous_close = previous_close
+        return fi
+
+    def test_returns_gap_alert_when_gap_exceeds_threshold(self):
+        fi = self._make_fast_info(pre_market_price=105.0, previous_close=100.0)
+        mock_ticker = MagicMock()
+        mock_ticker.fast_info = fi
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            alerts = check_premarket_gaps(["AAPL"], gap_threshold_pct=0.02)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert isinstance(alert, GapAlert)
+        assert alert.symbol == "AAPL"
+        assert alert.prev_close == pytest.approx(100.0)
+        assert alert.premarket_price == pytest.approx(105.0)
+        assert alert.gap_pct == pytest.approx(0.05)
+
+    def test_skips_symbol_when_gap_below_threshold(self):
+        fi = self._make_fast_info(pre_market_price=100.5, previous_close=100.0)
+        mock_ticker = MagicMock()
+        mock_ticker.fast_info = fi
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            alerts = check_premarket_gaps(["AAPL"], gap_threshold_pct=0.02)
+        assert alerts == []
+
+    def test_skips_symbol_when_premarket_price_none(self):
+        fi = self._make_fast_info(pre_market_price=None, previous_close=100.0)
+        mock_ticker = MagicMock()
+        mock_ticker.fast_info = fi
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            alerts = check_premarket_gaps(["AAPL"])
+        assert alerts == []
+
+    def test_gap_down_detected(self):
+        fi = self._make_fast_info(pre_market_price=95.0, previous_close=100.0)
+        mock_ticker = MagicMock()
+        mock_ticker.fast_info = fi
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            alerts = check_premarket_gaps(["TSLA"], gap_threshold_pct=0.02)
+        assert len(alerts) == 1
+        assert alerts[0].gap_pct == pytest.approx(-0.05)
+
+    def test_exception_on_single_symbol_does_not_abort(self):
+        mock_ticker = MagicMock()
+        mock_ticker.fast_info = MagicMock(side_effect=RuntimeError("network error"))
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            alerts = check_premarket_gaps(["AAPL"])
+        assert alerts == []
+
+
+# ---------------------------------------------------------------------------
+# get_earnings_this_week / has_earnings_within_days
+# ---------------------------------------------------------------------------
+
+
+class TestEarningsCalendar:
+    def _mock_ticker_with_earnings(self, symbol: str, days_from_now: int):
+        today = datetime.date.today()
+        earnings_date = today + datetime.timedelta(days=days_from_now)
+
+        mock_ticker = MagicMock()
+        mock_ticker.calendar = {"Earnings Date": [earnings_date]}
+        return mock_ticker
+
+    def test_get_earnings_this_week_includes_symbol_with_earnings_in_5_days(self):
+        mock_ticker = self._mock_ticker_with_earnings("AAPL", days_from_now=5)
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            result = get_earnings_this_week(["AAPL"])
+        assert "AAPL" in result
+
+    def test_get_earnings_this_week_excludes_symbol_earnings_in_10_days(self):
+        mock_ticker = self._mock_ticker_with_earnings("AAPL", days_from_now=10)
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            result = get_earnings_this_week(["AAPL"])
+        assert "AAPL" not in result
+
+    def test_has_earnings_within_days_returns_date_when_within_window(self):
+        today = datetime.date.today()
+        earnings_tomorrow = today + datetime.timedelta(days=1)
+        mock_ticker = MagicMock()
+        mock_ticker.calendar = {"Earnings Date": [earnings_tomorrow]}
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            result = has_earnings_within_days("AAPL", days=2)
+        assert result == earnings_tomorrow
+
+    def test_has_earnings_within_days_returns_none_when_outside_window(self):
+        today = datetime.date.today()
+        earnings_in_5_days = today + datetime.timedelta(days=5)
+        mock_ticker = MagicMock()
+        mock_ticker.calendar = {"Earnings Date": [earnings_in_5_days]}
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            result = has_earnings_within_days("AAPL", days=2)
+        assert result is None
+
+    def test_get_next_earnings_date_returns_none_on_empty_calendar(self):
+        mock_ticker = MagicMock()
+        mock_ticker.calendar = {}
+        with patch("lib.stock_scanner.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            result = _get_next_earnings_date("AAPL")
+        assert result is None
+
+    def test_get_next_earnings_date_returns_none_when_yfinance_unavailable(self):
+        with patch("lib.stock_scanner._YFINANCE_AVAILABLE", False):
+            result = _get_next_earnings_date("AAPL")
+        assert result is None

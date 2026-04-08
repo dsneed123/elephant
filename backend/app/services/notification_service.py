@@ -73,6 +73,52 @@ def notify_stop_loss(trade) -> None:
     })
 
 
+def notify_gap_alerts(gaps: list) -> None:
+    """Post a pre-market Gap Alert embed for stocks gapping significantly."""
+    if not gaps:
+        return
+    fields = []
+    for gap in gaps:
+        direction = "UP" if gap.gap_pct > 0 else "DOWN"
+        fields.append({
+            "name": f"{gap.symbol}  {direction}",
+            "value": (
+                f"Prev close: ${gap.prev_close:.2f}\n"
+                f"Pre-market: ${gap.premarket_price:.2f}\n"
+                f"Gap: {gap.gap_pct:+.1%}"
+            ),
+            "inline": True,
+        })
+    _post_webhook({
+        "embeds": [{
+            "title": "Pre-Market Gap Alert",
+            "color": 0xFFA500,
+            "fields": fields,
+        }]
+    })
+
+
+def notify_earnings_watch(earnings: dict) -> None:
+    """Post a weekly Earnings Watch embed listing watchlist stocks reporting this week."""
+    if not earnings:
+        return
+    fields = [
+        {"name": symbol, "value": str(date), "inline": True}
+        for symbol, date in sorted(earnings.items())
+    ]
+    _post_webhook({
+        "embeds": [{
+            "title": "Earnings Watch — This Week",
+            "color": 0xFEE75C,
+            "description": (
+                "Watchlist stocks with earnings this week. "
+                "Swing signals are suppressed within 2 days of earnings."
+            ),
+            "fields": fields,
+        }]
+    })
+
+
 def notify_daily_loss_warning(daily_loss: float, portfolio_value: float) -> None:
     """Notify when daily loss exceeds 80% of max_daily_loss_pct."""
     loss_pct = daily_loss / portfolio_value if portfolio_value > 0 else 0.0
