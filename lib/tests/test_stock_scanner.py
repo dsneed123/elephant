@@ -15,15 +15,22 @@ import stock_scanner as sc
 from stock_scanner import (
     AGAINST_TREND_PENALTY,
     RSI_PERIOD,
+    ROTATION_LONG_WINDOW,
+    ROTATION_SHORT_WINDOW,
+    SECTOR_ETFS,
     SIGNAL_EXPIRY_DAYS,
     SUMMARY_LOOKBACK_DAYS,
+    SYMBOL_SECTOR,
     TARGET_1_PCT,
     STOP_PCT,
     TREND_ALIGNMENT_BONUS,
+    WATCHLIST,
     PriceBar,
+    SectorRotationSignal,
     SwingSignal,
     _compute_rsi,
     _compute_sma,
+    _count_active_by_sector,
     _detect_rsi_divergence,
     _detect_weekly_trend,
     _is_near_support_resistance,
@@ -32,7 +39,10 @@ from stock_scanner import (
     _performance_stats,
     _resolve_open_signals,
     _save_signal_state,
+    _scan_header_embed,
+    _sector_rotation_embed,
     _signal_embed,
+    detect_sector_rotation,
     scan,
     scan_with_tracking,
 )
@@ -733,3 +743,242 @@ class TestScanWithTracking:
             titles = [p["title"] for p in posted]
             assert any("Signal" in t for t in titles)
             assert any("Performance" in t for t in titles)
+
+
+# ── WATCHLIST / SECTOR_ETFS / SYMBOL_SECTOR ───────────────────────────────────
+
+
+class TestWatchlist:
+    def test_total_symbols_at_least_80(self):
+        total = sum(len(syms) for syms in WATCHLIST.values())
+        assert total >= 80
+
+    def test_required_industrials_present(self):
+        assert "CAT" in WATCHLIST["industrials"]
+        assert "DE" in WATCHLIST["industrials"]
+        assert "GE" in WATCHLIST["industrials"]
+
+    def test_required_healthcare_present(self):
+        assert "LLY" in WATCHLIST["healthcare"]
+        assert "MRNA" in WATCHLIST["healthcare"]
+
+    def test_required_consumer_staples_present(self):
+        assert "WMT" in WATCHLIST["consumer_staples"]
+        assert "COST" in WATCHLIST["consumer_staples"]
+        assert "TGT" in WATCHLIST["consumer_staples"]
+
+    def test_required_real_estate_present(self):
+        assert "O" in WATCHLIST["real_estate"]
+        assert "AMT" in WATCHLIST["real_estate"]
+
+    def test_required_utilities_present(self):
+        assert "NEE" in WATCHLIST["utilities"]
+        assert "SO" in WATCHLIST["utilities"]
+
+    def test_required_etfs_present(self):
+        for sym in ("GLD", "SLV", "TLT", "HYG"):
+            assert sym in WATCHLIST["etfs"]
+
+    def test_sector_etfs_has_required_entries(self):
+        for etf in ("XLF", "XLE", "XLK", "XLV", "XLI", "XLU", "XLP", "XLC", "XLRE"):
+            assert etf in SECTOR_ETFS
+
+    def test_symbol_sector_covers_all_watchlist_symbols(self):
+        for sector, syms in WATCHLIST.items():
+            for sym in syms:
+                assert sym in SYMBOL_SECTOR, f"{sym} missing from SYMBOL_SECTOR"
+                assert SYMBOL_SECTOR[sym] == sector
+
+    def test_symbol_sector_covers_sector_etfs(self):
+        for etf in SECTOR_ETFS:
+            assert etf in SYMBOL_SECTOR
+
+
+# ── detect_sector_rotation ────────────────────────────────────────────────────
+
+
+def _sector_bars(returns: dict[str, float], length: int = 25) -> dict[str, list[PriceBar]]:
+    """Build minimal sector bar dicts: each ETF ends at base * (1 + return)."""
+    result: dict[str, list[PriceBar]] = {}
+    for etf, ret in returns.items():
+        start = 100.0
+        end = start * (1.0 + ret)
+        step = (end - start) / max(length - 1, 1)
+        bars = [
+            PriceBar(open=start + i * step, high=start + i * step,
+                     low=start + i * step, close=start + i * step)
+            for i in range(length)
+        ]
+        result[etf] = bars
+    return result
+
+
+class TestDetectSectorRotation:
+    def test_returns_none_when_fewer_than_two_etfs_have_data(self):
+        bars = _sector_bars({"XLK": 0.05}, length=25)
+        assert detect_sector_rotation(bars) is None
+
+    def test_returns_none_when_insufficient_bars(self):
+        bars = _sector_bars({"XLK": 0.05, "XLF": -0.03}, length=10)
+        # long window is 20 so 10 bars are not enough
+        result = detect_sector_rotation(bars, short_window=5, long_window=20)
+        assert result is None
+
+    def test_returns_sector_rotation_signal(self):
+        bars = _sector_bars({"XLK": 0.05, "XLF": -0.03, "XLE": 0.01}, length=25)
+        result = detect_sector_rotation(bars, short_window=5, long_window=20)
+        assert isinstance(result, SectorRotationSignal)
+
+    def test_top_performer_in_strengthening(self):
+        bars = _sector_bars({"XLK": 0.10, "XLF": -0.05, "XLE": 0.01}, length=25)
+        result = detect_sector_rotation(bars, short_window=5, long_window=20)
+        assert result is not None
+        strong_etfs = [e for e, _, _ in result.strengthening]
+        # XLK has highest return and should appear in strengthening
+        assert "XLK" in strong_etfs
+
+    def test_bottom_performer_in_weakening(self):
+        bars = _sector_bars({"XLK": 0.10, "XLF": -0.10, "XLE": 0.01}, length=25)
+        result = detect_sector_rotation(bars, short_window=5, long_window=20)
+        assert result is not None
+        weak_etfs = [e for e, _, _ in result.weakening]
+        assert "XLF" in weak_etfs
+
+    def test_all_sectors_sorted_best_first(self):
+        bars = _sector_bars({"XLK": 0.10, "XLF": -0.05, "XLE": 0.03}, length=25)
+        result = detect_sector_rotation(bars, short_window=5, long_window=20)
+        assert result is not None
+        rets = [r for _, _, r, _ in result.all_sectors]
+        assert rets == sorted(rets, reverse=True)
+
+    def test_sector_name_resolved_from_sector_etfs(self):
+        bars = _sector_bars({"XLK": 0.05, "XLF": -0.03}, length=25)
+        result = detect_sector_rotation(bars, short_window=5, long_window=20)
+        assert result is not None
+        all_names = [name for _, name, _, _ in result.all_sectors]
+        assert "Technology" in all_names
+        assert "Financials" in all_names
+
+
+# ── _sector_rotation_embed ────────────────────────────────────────────────────
+
+
+class TestSectorRotationEmbed:
+    def _make_rotation(self) -> SectorRotationSignal:
+        return SectorRotationSignal(
+            strengthening=[("XLK", "Technology", 0.05), ("XLV", "Health Care", 0.02)],
+            weakening=[("XLF", "Financials", -0.03), ("XLE", "Energy", -0.06)],
+            all_sectors=[
+                ("XLK", "Technology", 0.05, 0.03),
+                ("XLV", "Health Care", 0.02, 0.01),
+                ("XLF", "Financials", -0.03, -0.01),
+                ("XLE", "Energy", -0.06, -0.04),
+            ],
+        )
+
+    def test_title_is_sector_rotation_alert(self):
+        embed = _sector_rotation_embed(self._make_rotation())
+        assert embed["title"] == "Sector Rotation Alert"
+
+    def test_has_strengthening_and_weakening_fields(self):
+        embed = _sector_rotation_embed(self._make_rotation())
+        names = [f["name"] for f in embed["fields"]]
+        assert any("Strengthening" in n for n in names)
+        assert any("Weakening" in n for n in names)
+
+    def test_active_by_sector_field_included_when_provided(self):
+        embed = _sector_rotation_embed(self._make_rotation(), {"technology": 3, "energy": 1})
+        names = [f["name"] for f in embed["fields"]]
+        assert any("Active" in n for n in names)
+
+    def test_active_by_sector_field_omitted_when_empty(self):
+        embed = _sector_rotation_embed(self._make_rotation(), {})
+        names = [f["name"] for f in embed["fields"]]
+        assert not any("Active" in n for n in names)
+
+    def test_active_by_sector_field_omitted_when_none(self):
+        embed = _sector_rotation_embed(self._make_rotation(), None)
+        names = [f["name"] for f in embed["fields"]]
+        assert not any("Active" in n for n in names)
+
+    def test_strengthening_shows_positive_return(self):
+        embed = _sector_rotation_embed(self._make_rotation())
+        strong_field = next(f for f in embed["fields"] if "Strengthening" in f["name"])
+        assert "+5.00%" in strong_field["value"] or "▲" in strong_field["value"]
+
+
+# ── _scan_header_embed ────────────────────────────────────────────────────────
+
+
+class TestScanHeaderEmbed:
+    def test_title_contains_scan(self):
+        embed = _scan_header_embed(50, {})
+        assert "Scan" in embed["title"]
+
+    def test_description_mentions_symbol_count(self):
+        embed = _scan_header_embed(50, {"technology": 2})
+        assert "50" in embed["description"]
+
+    def test_description_mentions_sector_count(self):
+        embed = _scan_header_embed(50, {})
+        assert str(len(WATCHLIST)) in embed["description"]
+
+    def test_active_signals_shown(self):
+        embed = _scan_header_embed(30, {"technology": 3, "energy": 1})
+        field = embed["fields"][0]
+        assert "technology" in field["value"]
+        assert "energy" in field["value"]
+
+    def test_no_active_signals_fallback(self):
+        embed = _scan_header_embed(30, {})
+        assert "No active signals" in embed["fields"][0]["value"]
+
+
+# ── _count_active_by_sector ───────────────────────────────────────────────────
+
+
+class TestCountActiveBySector:
+    def _rec(self, symbol: str, status: str) -> dict:
+        return {
+            "id": "x",
+            "symbol": symbol,
+            "direction": "LONG",
+            "strength": 60,
+            "reasons": [],
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "entry_price": 100.0,
+            "target_1": 103.0,
+            "target_2": 106.0,
+            "stop": 98.0,
+            "status": status,
+            "closed_at": None,
+            "pnl_pct": None,
+        }
+
+    def test_counts_open_signals_by_sector(self):
+        records = [self._rec("AAPL", "OPEN"), self._rec("MSFT", "OPEN")]
+        counts = _count_active_by_sector(records)
+        assert counts.get("technology", 0) == 2
+
+    def test_ignores_non_open_signals(self):
+        records = [self._rec("AAPL", "WIN"), self._rec("MSFT", "LOSS")]
+        counts = _count_active_by_sector(records)
+        assert sum(counts.values()) == 0
+
+    def test_unknown_symbol_mapped_to_other(self):
+        records = [self._rec("UNKN", "OPEN")]
+        counts = _count_active_by_sector(records)
+        assert counts.get("other", 0) == 1
+
+    def test_mixed_sectors(self):
+        records = [
+            self._rec("AAPL", "OPEN"),   # technology
+            self._rec("JPM", "OPEN"),    # financials
+            self._rec("MSFT", "OPEN"),   # technology
+        ]
+        counts = _count_active_by_sector(records)
+        assert counts.get("technology", 0) == 2
+        assert counts.get("financials", 0) == 1
+
+    def test_empty_records(self):
+        assert _count_active_by_sector([]) == {}
