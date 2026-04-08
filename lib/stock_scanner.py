@@ -51,6 +51,49 @@ SUMMARY_LOOKBACK_DAYS: int = 30   # performance summary window
 _REPO_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_FILE: str = os.path.join(_REPO_ROOT, "state", "swing_signals.json")
 
+# ── watchlist ─────────────────────────────────────────────────────────────────
+
+WATCHLIST: dict[str, list[str]] = {
+    "technology": ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "TSM", "AVGO", "ORCL", "QCOM", "INTC"],
+    "financials": ["JPM", "BAC", "GS", "MS", "WFC", "V", "MA", "BRK.B", "C", "AXP", "BLK", "SCHW"],
+    "energy": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "HAL"],
+    "healthcare": ["JNJ", "UNH", "LLY", "PFE", "ABBV", "MRK", "ABT", "AMGN", "MRNA", "BMY", "GILD", "CVS"],
+    "industrials": ["CAT", "DE", "GE", "HON", "UPS", "BA", "MMM", "LMT", "RTX", "FDX"],
+    "consumer_discretionary": ["TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "TJX", "BKNG"],
+    "consumer_staples": ["WMT", "COST", "TGT", "PG", "KO", "PEP", "MDLZ", "CL"],
+    "real_estate": ["O", "AMT", "PLD", "SPG", "EQIX", "CCI", "PSA", "DLR"],
+    "utilities": ["NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "WEC"],
+    "etfs": ["SPY", "QQQ", "IWM", "GLD", "SLV", "TLT", "HYG", "VIX"],
+}
+
+# Sector ETFs used for rotation detection
+SECTOR_ETFS: dict[str, str] = {
+    "XLF": "Financials",
+    "XLE": "Energy",
+    "XLK": "Technology",
+    "XLV": "Health Care",
+    "XLI": "Industrials",
+    "XLU": "Utilities",
+    "XLP": "Consumer Staples",
+    "XLC": "Communication",
+    "XLRE": "Real Estate",
+}
+
+# Flat symbol → sector mapping built from WATCHLIST + SECTOR_ETFS
+SYMBOL_SECTOR: dict[str, str] = {
+    sym: sector
+    for sector, syms in WATCHLIST.items()
+    for sym in syms
+}
+SYMBOL_SECTOR.update(
+    {etf: label.lower().replace(" ", "_") for etf, label in SECTOR_ETFS.items()}
+)
+
+# ── sector rotation windows ───────────────────────────────────────────────────
+
+ROTATION_SHORT_WINDOW: int = 5   # 5-day relative-strength window
+ROTATION_LONG_WINDOW: int = 20   # 20-day relative-strength window
+
 
 # ── data structures ───────────────────────────────────────────────────────────
 
@@ -74,6 +117,21 @@ class SwingSignal:
     direction: str          # "LONG" or "SHORT"
     strength: int           # 0–100 (higher = stronger signal)
     reasons: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SectorRotationSignal:
+    """
+    Detected rotation between sector ETFs based on relative strength.
+
+    Each entry in *strengthening* / *weakening* is (etf_symbol, sector_name, 5d_return).
+    *all_sectors* holds every ETF ranked best-to-worst by their short-window return,
+    as (etf_symbol, sector_name, short_return, long_return).
+    """
+
+    strengthening: list[tuple[str, str, float]]     # gaining relative strength
+    weakening: list[tuple[str, str, float]]         # losing relative strength
+    all_sectors: list[tuple[str, str, float, float]]
 
 
 # ── indicator helpers ─────────────────────────────────────────────────────────
@@ -217,6 +275,55 @@ def _is_near_support_resistance(
             return True
 
     return False
+
+
+# ── sector rotation detection ─────────────────────────────────────────────────
+
+
+def detect_sector_rotation(
+    sector_bars: dict[str, Sequence[PriceBar]],
+    short_window: int = ROTATION_SHORT_WINDOW,
+    long_window: int = ROTATION_LONG_WINDOW,
+) -> SectorRotationSignal | None:
+    """
+    Detect sector rotation by comparing relative strength of sector ETFs.
+
+    For each ETF supplied in *sector_bars*, computes:
+      - short-window return: close[-1] / close[-short_window-1] − 1
+      - long-window return:  close[-1] / close[-long_window-1] − 1
+
+    ETFs whose short-window return exceeds the cross-sector average are classified
+    as "strengthening"; those below average are "weakening".
+
+    Returns None when fewer than two ETFs have sufficient price history.
+    """
+    ranked: list[tuple[str, str, float, float]] = []
+
+    for etf, bars in sector_bars.items():
+        sector_name = SECTOR_ETFS.get(etf, etf)
+        closes = [b.close for b in bars]
+        if len(closes) < long_window + 1:
+            logger.debug("Sector rotation: %s has only %d bars (need %d)", etf, len(closes), long_window + 1)
+            continue
+        price_now = closes[-1]
+        ret_short = price_now / closes[-(short_window + 1)] - 1.0
+        ret_long = price_now / closes[-(long_window + 1)] - 1.0
+        ranked.append((etf, sector_name, ret_short, ret_long))
+
+    if len(ranked) < 2:
+        return None
+
+    ranked.sort(key=lambda x: x[2], reverse=True)  # best short-window return first
+    avg_short = sum(r[2] for r in ranked) / len(ranked)
+
+    strengthening = [(etf, name, ret_s) for etf, name, ret_s, _ in ranked if ret_s > avg_short]
+    weakening = [(etf, name, ret_s) for etf, name, ret_s, _ in ranked if ret_s < avg_short]
+
+    return SectorRotationSignal(
+        strengthening=strengthening,
+        weakening=weakening,
+        all_sectors=ranked,
+    )
 
 
 # ── public interface ──────────────────────────────────────────────────────────
