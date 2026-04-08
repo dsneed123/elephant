@@ -599,6 +599,86 @@ def _post_discord_embed(embed: dict, webhook_url: str) -> None:
         logger.warning("Discord webhook POST failed: %s", exc)
 
 
+def _count_active_by_sector(records: list[dict]) -> dict[str, int]:
+    """Return OPEN signal counts grouped by sector (uses SYMBOL_SECTOR mapping)."""
+    counts: dict[str, int] = {}
+    for rec in records:
+        if rec["status"] != "OPEN":
+            continue
+        sector = SYMBOL_SECTOR.get(rec["symbol"], "other")
+        counts[sector] = counts.get(sector, 0) + 1
+    return counts
+
+
+def _sector_rotation_embed(
+    rotation: SectorRotationSignal,
+    active_by_sector: dict[str, int] | None = None,
+) -> dict:
+    """Build a Discord embed for a Sector Rotation Alert."""
+
+    def _row(etf: str, name: str, ret: float) -> str:
+        arrow = "▲" if ret >= 0 else "▼"
+        return f"{arrow} **{etf}** ({name}): {ret:+.2%}"
+
+    strong_lines = [_row(e, n, r) for e, n, r in rotation.strengthening[:4]] or ["—"]
+    weak_lines = [_row(e, n, r) for e, n, r in rotation.weakening[-4:]] or ["—"]
+
+    fields: list[dict] = [
+        {"name": "Strengthening ↑", "value": "\n".join(strong_lines), "inline": True},
+        {"name": "Weakening ↓", "value": "\n".join(weak_lines), "inline": True},
+    ]
+
+    if active_by_sector:
+        top = sorted(active_by_sector.items(), key=lambda x: x[1], reverse=True)[:5]
+        sector_lines = [
+            f"**{s}**: {n} signal{'s' if n != 1 else ''}" for s, n in top if n > 0
+        ]
+        if sector_lines:
+            fields.append({
+                "name": "Most Active Sectors",
+                "value": "\n".join(sector_lines),
+                "inline": False,
+            })
+
+    return {
+        "title": "Sector Rotation Alert",
+        "color": 0xFEE75C,
+        "fields": fields,
+    }
+
+
+def _scan_header_embed(
+    total_symbols: int,
+    active_by_sector: dict[str, int],
+) -> dict:
+    """
+    Build a Discord embed posted at the start of each scan run.
+
+    Shows the number of symbols being scanned and which sectors currently
+    have the most open signals.
+    """
+    top = sorted(active_by_sector.items(), key=lambda x: x[1], reverse=True)
+    sector_lines = [
+        f"**{s}**: {n} active signal{'s' if n != 1 else ''}" for s, n in top if n > 0
+    ] or ["No active signals"]
+
+    return {
+        "title": "Swing Scanner — Scan Run",
+        "description": (
+            f"Scanning {total_symbols} symbol{'s' if total_symbols != 1 else ''} "
+            f"across {len(WATCHLIST)} sectors"
+        ),
+        "color": 0x5865F2,
+        "fields": [
+            {
+                "name": "Active Signals by Sector",
+                "value": "\n".join(sector_lines),
+                "inline": False,
+            }
+        ],
+    }
+
+
 def scan_with_tracking(
     symbol: str,
     daily_bars: Sequence[PriceBar],
