@@ -14,6 +14,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import stock_scanner as sc
 from stock_scanner import (
     AGAINST_TREND_PENALTY,
+    EARNINGS_EXCLUDE_DAYS,
+    EARNINGS_WARN_DAYS,
+    GAP_THRESHOLD,
     RSI_PERIOD,
     ROTATION_LONG_WINDOW,
     ROTATION_SHORT_WINDOW,
@@ -33,6 +36,8 @@ from stock_scanner import (
     _count_active_by_sector,
     _detect_rsi_divergence,
     _detect_weekly_trend,
+    _earnings_watch_embed,
+    _gap_alert_embed,
     _is_near_support_resistance,
     _load_signal_state,
     _performance_embed,
@@ -43,7 +48,11 @@ from stock_scanner import (
     _sector_rotation_embed,
     _signal_embed,
     detect_sector_rotation,
+    get_earnings_date,
+    get_pre_market_gap,
+    post_earnings_watch,
     scan,
+    scan_pre_market_gaps,
     scan_with_tracking,
 )
 

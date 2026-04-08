@@ -6,10 +6,20 @@ support/resistance proximity checks to reduce false swing signals.
 Signal strength is a 0–100 score. Adjustments applied:
   +15  trend_alignment bonus  — daily and weekly trend both agree with direction
   -20  weekly_trend_penalty   — signal direction opposes the weekly trend
+
+Pre-market gap detection and earnings calendar awareness require yfinance.
+Install with: pip install yfinance
 """
 
+import datetime
 from dataclasses import dataclass, field
 from enum import Enum
+
+try:
+    import yfinance as yf
+    _YFINANCE_AVAILABLE = True
+except ImportError:
+    _YFINANCE_AVAILABLE = False
 
 
 class Direction(str, Enum):
@@ -29,6 +39,16 @@ class OHLCV:
 
 
 @dataclass
+class GapAlert:
+    """Pre-market gap event for a single symbol."""
+
+    symbol: str
+    prev_close: float
+    premarket_price: float
+    gap_pct: float           # positive = gap up, negative = gap down
+
+
+@dataclass
 class SwingSignal:
     """Result of multi-timeframe analysis for a single symbol."""
 
@@ -40,6 +60,8 @@ class SwingSignal:
     trend_aligned: bool      # daily and weekly trends both agree with direction
     near_support_resistance: bool
     rsi_divergence: bool     # 4H RSI divergence in the signal direction
+    earnings_date: datetime.date | None = None   # upcoming earnings date if within this week
+    earnings_excluded: bool = False              # True if excluded due to earnings within 2 days
     notes: list[str] = field(default_factory=list)
 
 
@@ -223,6 +245,7 @@ def apply_multi_timeframe_filters(
     weekly_bars: list[OHLCV],
     four_hour_bars: list[OHLCV],
     current_price: float,
+    earnings_date: datetime.date | None = None,
 ) -> SwingSignal:
     """
     Apply multi-timeframe confirmation filters to a raw swing signal.
@@ -236,10 +259,14 @@ def apply_multi_timeframe_filters(
     weekly_bars:    Weekly OHLCV history (50+ bars recommended).
     four_hour_bars: 4-hour OHLCV history (20+ bars recommended).
     current_price:  Latest price for S/R proximity check.
+    earnings_date:  Known upcoming earnings date for this symbol, if any.
+                    When provided, signals are excluded if earnings fall within
+                    2 days, and flagged with a warning if within the week.
 
     Returns
     -------
     SwingSignal with adjusted strength and diagnostic notes.
+    earnings_excluded=True signals the caller should skip this trade.
 
     Strength adjustments
     --------------------
@@ -293,6 +320,21 @@ def apply_multi_timeframe_filters(
 
     strength = max(0.0, min(100.0, strength))
 
+    # --- Earnings proximity check ---
+    earnings_excluded = False
+    if earnings_date is not None:
+        today = datetime.date.today()
+        days_to_earnings = (earnings_date - today).days
+        if 0 <= days_to_earnings <= 2:
+            earnings_excluded = True
+            notes.append(
+                f"EARNINGS {earnings_date}: excluded — earnings within {days_to_earnings} day(s)"
+            )
+        elif days_to_earnings > 2:
+            notes.append(
+                f"EARNINGS {earnings_date}: caution — earnings this week"
+            )
+
     return SwingSignal(
         symbol=symbol,
         direction=direction,
@@ -302,5 +344,118 @@ def apply_multi_timeframe_filters(
         trend_aligned=trend_aligned,
         near_support_resistance=near_sr,
         rsi_divergence=rsi_divergence,
+        earnings_date=earnings_date,
+        earnings_excluded=earnings_excluded,
         notes=notes,
     )
+
+
+# ---------------------------------------------------------------------------
+# yfinance-backed helpers (require yfinance to be installed)
+# ---------------------------------------------------------------------------
+
+
+def _get_next_earnings_date(symbol: str) -> datetime.date | None:
+    """
+    Fetch the next scheduled earnings date for *symbol* from yfinance.
+
+    Returns None when no date is available or yfinance is not installed.
+    """
+    if not _YFINANCE_AVAILABLE:
+        return None
+    try:
+        ticker = yf.Ticker(symbol)
+        cal = ticker.calendar
+        if cal is None:
+            return None
+
+        dates: list = []
+        if hasattr(cal, "columns"):
+            # Newer yfinance returns a DataFrame
+            if "Earnings Date" in cal.columns:
+                dates = cal["Earnings Date"].dropna().tolist()
+        elif isinstance(cal, dict):
+            raw = cal.get("Earnings Date", [])
+            dates = raw if isinstance(raw, list) else [raw]
+
+        valid = [
+            d.date() if hasattr(d, "date") else d
+            for d in dates
+            if d is not None
+        ]
+        return min(valid) if valid else None
+    except Exception:
+        return None
+
+
+def check_premarket_gaps(
+    symbols: list[str],
+    gap_threshold_pct: float = 0.02,
+) -> list[GapAlert]:
+    """
+    Return a GapAlert for each symbol whose pre-market price gaps beyond
+    *gap_threshold_pct* from the previous regular-session close.
+
+    Requires yfinance. Symbols where pre-market data is unavailable are
+    silently skipped.
+    """
+    if not _YFINANCE_AVAILABLE:
+        raise ImportError("yfinance is required for pre-market gap scanning")
+
+    alerts: list[GapAlert] = []
+    for symbol in symbols:
+        try:
+            info = yf.Ticker(symbol).fast_info
+            premarket_price: float | None = getattr(info, "pre_market_price", None)
+            prev_close: float | None = (
+                getattr(info, "previous_close", None)
+                or getattr(info, "regular_market_previous_close", None)
+            )
+            if premarket_price is None or not prev_close:
+                continue
+            gap_pct = (premarket_price - prev_close) / prev_close
+            if abs(gap_pct) >= gap_threshold_pct:
+                alerts.append(
+                    GapAlert(
+                        symbol=symbol,
+                        prev_close=prev_close,
+                        premarket_price=premarket_price,
+                        gap_pct=gap_pct,
+                    )
+                )
+        except Exception:
+            continue
+
+    return alerts
+
+
+def get_earnings_this_week(symbols: list[str]) -> dict[str, datetime.date]:
+    """
+    Return a mapping of symbol -> earnings date for each symbol in *symbols*
+    that has earnings scheduled within the next 7 calendar days.
+
+    Requires yfinance. Symbols with no available earnings data are omitted.
+    """
+    today = datetime.date.today()
+    week_end = today + datetime.timedelta(days=7)
+    result: dict[str, datetime.date] = {}
+    for symbol in symbols:
+        date = _get_next_earnings_date(symbol)
+        if date is not None and today <= date <= week_end:
+            result[symbol] = date
+    return result
+
+
+def has_earnings_within_days(symbol: str, days: int = 2) -> datetime.date | None:
+    """
+    Return the upcoming earnings date if *symbol* reports earnings within
+    *days* calendar days from today, otherwise None.
+
+    Requires yfinance.
+    """
+    today = datetime.date.today()
+    cutoff = today + datetime.timedelta(days=days)
+    date = _get_next_earnings_date(symbol)
+    if date is not None and today <= date <= cutoff:
+        return date
+    return None

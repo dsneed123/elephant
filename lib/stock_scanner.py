@@ -7,6 +7,9 @@ Signal generation pipeline:
   3. 4-hour RSI divergence — bullish/bearish divergence boosts strength
   4. Support/resistance proximity — round numbers and previous swing highs/lows
   5. Strength adjustments — +15 trend alignment, -20 against-trend penalty
+
+Pre-market gap detection and earnings calendar awareness require yfinance.
+Install with: pip install yfinance
 """
 
 from __future__ import annotations
@@ -21,6 +24,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Sequence
 from urllib.request import Request, urlopen
 import urllib.error
+
+try:
+    import yfinance as _yf
+    _YFINANCE_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _yf = None  # type: ignore[assignment]
+    _YFINANCE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +56,15 @@ TARGET_2_PCT: float = 0.06        # 6 % second profit target
 STOP_PCT: float = 0.02            # 2 % stop-loss
 SIGNAL_EXPIRY_DAYS: int = 15      # open signals expire after 15 days
 SUMMARY_LOOKBACK_DAYS: int = 30   # performance summary window
+
+# ── pre-market gap detection ──────────────────────────────────────────────────
+
+GAP_THRESHOLD: float = 0.02       # 2 % gap triggers a Gap Alert
+
+# ── earnings calendar awareness ───────────────────────────────────────────────
+
+EARNINGS_EXCLUDE_DAYS: int = 2    # exclude swing signals if earnings within N days
+EARNINGS_WARN_DAYS: int = 7       # add "EARNINGS [date]" note if earnings within N days
 
 # state/swing_signals.json sits at the repo root (parent of lib/)
 _REPO_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -334,6 +353,8 @@ def scan(
     daily_bars: Sequence[PriceBar],
     weekly_bars: Sequence[PriceBar],
     four_hour_bars: Sequence[PriceBar],
+    *,
+    earnings_date: datetime | None = None,
 ) -> list[SwingSignal]:
     """
     Scan a single symbol for swing trade signals using multi-timeframe confirmation.
@@ -343,6 +364,9 @@ def scan(
       2. Weekly SMA20/SMA50 trend filter applies alignment bonus or against-trend penalty.
       3. 4-hour RSI divergence boosts strength when it confirms the signal.
       4. Support/resistance proximity adds a small strength bonus.
+      5. Earnings awareness — "EARNINGS [date]" note added when earnings fall within
+         EARNINGS_WARN_DAYS (7 days).  Callers should use *earnings_date* from
+         get_earnings_date(); scan_with_tracking() enforces the 2-day exclusion.
 
     Returns a list with 0 or 1 SwingSignal entries.
     """
@@ -408,6 +432,14 @@ def scan(
     if _is_near_support_resistance(current_price, daily_closes[:-1]):
         base_strength = min(100, base_strength + 5)
         reasons.append("near key support/resistance level")
+
+    # ── 5. Earnings awareness ─────────────────────────────────────────────
+    if earnings_date is not None:
+        now = datetime.now(tz=timezone.utc)
+        days_to_earnings = (earnings_date - now).days
+        if 0 <= days_to_earnings <= EARNINGS_WARN_DAYS:
+            date_str = earnings_date.strftime("%Y-%m-%d")
+            reasons.append(f"EARNINGS {date_str}")
 
     logger.info(
         "Signal: symbol=%s direction=%s strength=%d reasons=%s",
@@ -679,6 +711,219 @@ def _scan_header_embed(
     }
 
 
+# ── yfinance data fetchers ────────────────────────────────────────────────────
+
+
+def get_earnings_date(symbol: str) -> datetime | None:
+    """
+    Return the next earnings date for *symbol* using yfinance, or None.
+
+    Requires yfinance to be installed. Silently returns None on any failure
+    (import error, network error, missing data).
+    """
+    if not _YFINANCE_AVAILABLE:
+        logger.debug("yfinance not available; skipping earnings date for %s", symbol)
+        return None
+    try:
+        cal = _yf.Ticker(symbol).calendar
+        if not cal:
+            return None
+        raw = cal.get("Earnings Date")
+        if raw is None:
+            return None
+        # calendar["Earnings Date"] may be a list of Timestamps or a single value
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if raw is None:
+            return None
+        # Convert pandas Timestamp → datetime
+        if hasattr(raw, "to_pydatetime"):
+            dt = raw.to_pydatetime()
+        elif isinstance(raw, datetime):
+            dt = raw
+        else:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception as exc:  # pragma: no cover
+        logger.debug("Failed to fetch earnings date for %s: %s", symbol, exc)
+        return None
+
+
+def get_pre_market_gap(symbol: str) -> tuple[float, float, float] | None:
+    """
+    Fetch pre-market price and compute the gap from previous close.
+
+    Returns ``(gap_pct, pre_market_price, prev_close)`` where *gap_pct* is
+    positive for gap-ups and negative for gap-downs.  Returns None when
+    yfinance is unavailable or data is missing.
+    """
+    if not _YFINANCE_AVAILABLE:
+        logger.debug("yfinance not available; skipping pre-market gap for %s", symbol)
+        return None
+    try:
+        ticker = _yf.Ticker(symbol)
+        fi = ticker.fast_info
+        pre_price: float | None = getattr(fi, "pre_market_price", None)
+        prev_close: float | None = getattr(fi, "previous_close", None)
+        if prev_close is None:
+            prev_close = getattr(fi, "regular_market_previous_close", None)
+        if pre_price is None or prev_close is None or prev_close == 0:
+            return None
+        gap_pct = (pre_price - prev_close) / prev_close
+        return (gap_pct, pre_price, prev_close)
+    except Exception as exc:  # pragma: no cover
+        logger.debug("Failed to fetch pre-market gap for %s: %s", symbol, exc)
+        return None
+
+
+# ── gap / earnings embed builders ────────────────────────────────────────────
+
+
+def _gap_alert_embed(
+    symbol: str,
+    gap_pct: float,
+    pre_price: float,
+    prev_close: float,
+) -> dict:
+    """Build a Discord embed dict for a pre-market gap alert."""
+    direction = "UP" if gap_pct >= 0 else "DOWN"
+    color = 0x57F287 if gap_pct >= 0 else 0xED4245
+    return {
+        "title": f"Gap Alert — {symbol} ({direction})",
+        "color": color,
+        "fields": [
+            {"name": "Symbol", "value": symbol, "inline": True},
+            {"name": "Direction", "value": direction, "inline": True},
+            {"name": "Gap", "value": f"{gap_pct:+.2%}", "inline": True},
+            {"name": "Pre-Market Price", "value": f"${pre_price:.2f}", "inline": True},
+            {"name": "Prev Close", "value": f"${prev_close:.2f}", "inline": True},
+        ],
+    }
+
+
+def _earnings_watch_embed(earnings_list: list[tuple[str, str]]) -> dict:
+    """
+    Build a Discord embed dict for the weekly Earnings Watch.
+
+    *earnings_list* is a list of ``(symbol, date_str)`` tuples sorted by date.
+    """
+    if not earnings_list:
+        return {
+            "title": "Earnings Watch — This Week",
+            "description": "No watchlist stocks reporting earnings this week.",
+            "color": 0xFEE75C,
+            "fields": [],
+        }
+    lines = [f"**{sym}** — {date_str}" for sym, date_str in earnings_list]
+    return {
+        "title": "Earnings Watch — This Week",
+        "description": (
+            "Watchlist stocks reporting earnings this week. "
+            f"Swing signals are excluded within {EARNINGS_EXCLUDE_DAYS} days of earnings."
+        ),
+        "color": 0xFEE75C,
+        "fields": [
+            {
+                "name": "Upcoming Earnings",
+                "value": "\n".join(lines),
+                "inline": False,
+            }
+        ],
+    }
+
+
+# ── pre-market and earnings public functions ──────────────────────────────────
+
+
+def scan_pre_market_gaps(
+    symbols: list[str] | None = None,
+    *,
+    threshold: float = GAP_THRESHOLD,
+    webhook_url: str | None = None,
+) -> list[tuple[str, float, float, float]]:
+    """
+    Scan watchlist symbols for pre-market gaps exceeding *threshold*.
+
+    For each gapping stock a Gap Alert embed is posted to Discord.
+
+    Parameters
+    ----------
+    symbols:     Override the default full watchlist.
+    threshold:   Minimum absolute gap percentage (default 2 %).
+    webhook_url: Discord webhook URL; falls back to DISCORD_WEBHOOK_URL env var.
+
+    Returns
+    -------
+    List of ``(symbol, gap_pct, pre_market_price, prev_close)`` for gappers.
+    """
+    if webhook_url is None:
+        webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    if symbols is None:
+        symbols = [sym for syms in WATCHLIST.values() for sym in syms]
+
+    gaps: list[tuple[str, float, float, float]] = []
+    for sym in symbols:
+        result = get_pre_market_gap(sym)
+        if result is None:
+            continue
+        gap_pct, pre_price, prev_close = result
+        if abs(gap_pct) >= threshold:
+            gaps.append((sym, gap_pct, pre_price, prev_close))
+            logger.info(
+                "Gap alert: symbol=%s gap_pct=%.2f%% pre_price=%.2f prev_close=%.2f",
+                sym, gap_pct * 100, pre_price, prev_close,
+            )
+            if webhook_url:
+                _post_discord_embed(
+                    _gap_alert_embed(sym, gap_pct, pre_price, prev_close),
+                    webhook_url,
+                )
+    return gaps
+
+
+def post_earnings_watch(
+    symbols: list[str] | None = None,
+    *,
+    webhook_url: str | None = None,
+) -> list[tuple[str, str]]:
+    """
+    Fetch earnings dates and post a weekly Earnings Watch embed to Discord.
+
+    Intended to be called on Monday mornings.  Scans *symbols* (defaults to
+    the full watchlist) for any earnings falling within the next 7 days and
+    posts a single consolidated embed.
+
+    Returns
+    -------
+    List of ``(symbol, date_str)`` for stocks reporting earnings this week,
+    sorted by date.
+    """
+    if webhook_url is None:
+        webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    if symbols is None:
+        symbols = [sym for syms in WATCHLIST.values() for sym in syms]
+
+    now = datetime.now(tz=timezone.utc)
+    week_end = now + timedelta(days=EARNINGS_WARN_DAYS)
+
+    earnings_this_week: list[tuple[str, str]] = []
+    for sym in symbols:
+        edate = get_earnings_date(sym)
+        if edate is None:
+            continue
+        if now <= edate <= week_end:
+            date_str = edate.strftime("%Y-%m-%d")
+            earnings_this_week.append((sym, date_str))
+            logger.info("Earnings this week: %s on %s", sym, date_str)
+
+    earnings_this_week.sort(key=lambda x: x[1])
+
+    if webhook_url:
+        _post_discord_embed(_earnings_watch_embed(earnings_this_week), webhook_url)
+
+    return earnings_this_week
+
+
 def scan_with_tracking(
     symbol: str,
     daily_bars: Sequence[PriceBar],
@@ -686,6 +931,7 @@ def scan_with_tracking(
     four_hour_bars: Sequence[PriceBar],
     *,
     webhook_url: str | None = None,
+    earnings_date: datetime | None = None,
 ) -> list[SwingSignal]:
     """
     Scan a symbol for swing signals with persistent state tracking and Discord reporting.
@@ -693,14 +939,21 @@ def scan_with_tracking(
     On each call:
       1. Load existing signal records from state/swing_signals.json.
       2. Resolve any OPEN signals for *symbol* (WIN / LOSS / EXPIRED) using daily_bars.
-      3. Run the standard multi-timeframe scan() to detect new signals.
-      4. Record each new signal (entry, target_1, target_2, stop) in state.
-      5. Persist the updated records.
-      6. If new signals were found and a webhook URL is available, post a signal embed
+      3. If earnings fall within EARNINGS_EXCLUDE_DAYS (2 days), skip signal generation
+         and return [] to avoid holding through earnings.
+      4. Run the standard multi-timeframe scan() to detect new signals.
+         Earnings within EARNINGS_WARN_DAYS (7 days) are flagged in the signal reasons
+         as "EARNINGS [date]".
+      5. Record each new signal (entry, target_1, target_2, stop) in state.
+      6. Persist the updated records.
+      7. If new signals were found and a webhook URL is available, post a signal embed
          followed by a Performance Summary embed to Discord.
 
     The webhook URL is taken from the *webhook_url* parameter or the
     DISCORD_WEBHOOK_URL environment variable (parameter takes priority).
+
+    The *earnings_date* parameter should be the result of get_earnings_date(symbol).
+    When None, earnings filtering is skipped.
 
     Returns the same list[SwingSignal] as scan().
     """
@@ -710,7 +963,21 @@ def scan_with_tracking(
     records = _load_signal_state()
     records = _resolve_open_signals(records, symbol, daily_bars)
 
-    signals = scan(symbol, daily_bars, weekly_bars, four_hour_bars)
+    # Exclude signals when earnings are within EARNINGS_EXCLUDE_DAYS days
+    if earnings_date is not None:
+        now_check = datetime.now(tz=timezone.utc)
+        days_to_earnings = (earnings_date - now_check).days
+        if 0 <= days_to_earnings < EARNINGS_EXCLUDE_DAYS:
+            logger.info(
+                "%s: skipping signal — earnings in %d day(s) on %s",
+                symbol,
+                days_to_earnings,
+                earnings_date.strftime("%Y-%m-%d"),
+            )
+            _save_signal_state(records)
+            return []
+
+    signals = scan(symbol, daily_bars, weekly_bars, four_hour_bars, earnings_date=earnings_date)
 
     now = datetime.now(tz=timezone.utc)
     open_keys = {(r["symbol"], r["direction"]) for r in records if r["status"] == "OPEN"}
