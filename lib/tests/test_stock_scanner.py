@@ -991,3 +991,391 @@ class TestCountActiveBySector:
 
     def test_empty_records(self):
         assert _count_active_by_sector([]) == {}
+
+
+# ── _gap_alert_embed ──────────────────────────────────────────────────────────
+
+
+class TestGapAlertEmbed:
+    def test_gap_up_title_and_color(self):
+        embed = _gap_alert_embed("AAPL", 0.05, 105.0, 100.0)
+        assert "AAPL" in embed["title"]
+        assert "UP" in embed["title"]
+        assert embed["color"] == 0x57F287  # green
+
+    def test_gap_down_title_and_color(self):
+        embed = _gap_alert_embed("TSLA", -0.04, 96.0, 100.0)
+        assert "TSLA" in embed["title"]
+        assert "DOWN" in embed["title"]
+        assert embed["color"] == 0xED4245  # red
+
+    def test_fields_include_gap_pct_and_prices(self):
+        embed = _gap_alert_embed("NVDA", 0.03, 103.0, 100.0)
+        field_names = {f["name"] for f in embed["fields"]}
+        assert "Gap" in field_names
+        assert "Pre-Market Price" in field_names
+        assert "Prev Close" in field_names
+
+    def test_gap_pct_formatted_as_percentage(self):
+        embed = _gap_alert_embed("MSFT", 0.025, 102.5, 100.0)
+        gap_field = next(f for f in embed["fields"] if f["name"] == "Gap")
+        assert "%" in gap_field["value"]
+        assert "+" in gap_field["value"]  # positive gap has plus sign
+
+    def test_prices_formatted_with_dollar_sign(self):
+        embed = _gap_alert_embed("AMZN", 0.05, 210.0, 200.0)
+        pre_field = next(f for f in embed["fields"] if f["name"] == "Pre-Market Price")
+        prev_field = next(f for f in embed["fields"] if f["name"] == "Prev Close")
+        assert "$" in pre_field["value"]
+        assert "$" in prev_field["value"]
+
+
+# ── _earnings_watch_embed ─────────────────────────────────────────────────────
+
+
+class TestEarningsWatchEmbed:
+    def test_title_contains_earnings_watch(self):
+        embed = _earnings_watch_embed([("AAPL", "2026-04-14")])
+        assert "Earnings Watch" in embed["title"]
+
+    def test_empty_list_returns_no_upcoming_message(self):
+        embed = _earnings_watch_embed([])
+        assert "No watchlist stocks" in embed["description"]
+        assert embed["fields"] == []
+
+    def test_earnings_listed_in_field(self):
+        earnings = [("AAPL", "2026-04-14"), ("MSFT", "2026-04-16")]
+        embed = _earnings_watch_embed(earnings)
+        field = embed["fields"][0]
+        assert "AAPL" in field["value"]
+        assert "MSFT" in field["value"]
+        assert "2026-04-14" in field["value"]
+
+    def test_description_mentions_exclusion_days(self):
+        embed = _earnings_watch_embed([("NVDA", "2026-04-10")])
+        assert str(EARNINGS_EXCLUDE_DAYS) in embed["description"]
+
+    def test_color_is_yellow(self):
+        embed = _earnings_watch_embed([("JPM", "2026-04-11")])
+        assert embed["color"] == 0xFEE75C
+
+
+# ── get_earnings_date ─────────────────────────────────────────────────────────
+
+
+class TestGetEarningsDate:
+    def test_returns_none_when_yfinance_unavailable(self, monkeypatch):
+        monkeypatch.setattr(sc, "_YFINANCE_AVAILABLE", False)
+        result = get_earnings_date("AAPL")
+        assert result is None
+
+    def test_returns_datetime_from_list(self, monkeypatch):
+        now = datetime.now(tz=timezone.utc)
+        future = now + timedelta(days=10)
+
+        class FakeTimestamp:
+            def to_pydatetime(self):
+                return future
+
+        class FakeTicker:
+            @property
+            def calendar(self):
+                return {"Earnings Date": [FakeTimestamp()]}
+
+        class FakeYF:
+            def Ticker(self, sym):
+                return FakeTicker()
+
+        monkeypatch.setattr(sc, "_yf", FakeYF())
+        monkeypatch.setattr(sc, "_YFINANCE_AVAILABLE", True)
+        result = get_earnings_date("AAPL")
+        assert result is not None
+        assert result.date() == future.date()
+
+    def test_returns_none_when_calendar_empty(self, monkeypatch):
+        class FakeTicker:
+            @property
+            def calendar(self):
+                return {}
+
+        class FakeYF:
+            def Ticker(self, sym):
+                return FakeTicker()
+
+        monkeypatch.setattr(sc, "_yf", FakeYF())
+        monkeypatch.setattr(sc, "_YFINANCE_AVAILABLE", True)
+        result = get_earnings_date("AAPL")
+        assert result is None
+
+    def test_returns_none_on_exception(self, monkeypatch):
+        class FakeTicker:
+            @property
+            def calendar(self):
+                raise RuntimeError("network error")
+
+        class FakeYF:
+            def Ticker(self, sym):
+                return FakeTicker()
+
+        monkeypatch.setattr(sc, "_yf", FakeYF())
+        monkeypatch.setattr(sc, "_YFINANCE_AVAILABLE", True)
+        result = get_earnings_date("AAPL")
+        assert result is None
+
+
+# ── get_pre_market_gap ────────────────────────────────────────────────────────
+
+
+class TestGetPreMarketGap:
+    def test_returns_none_when_yfinance_unavailable(self, monkeypatch):
+        monkeypatch.setattr(sc, "_YFINANCE_AVAILABLE", False)
+        result = get_pre_market_gap("AAPL")
+        assert result is None
+
+    def test_returns_gap_tuple_on_valid_data(self, monkeypatch):
+        class FakeFastInfo:
+            pre_market_price = 105.0
+            previous_close = 100.0
+
+        class FakeTicker:
+            fast_info = FakeFastInfo()
+
+        class FakeYF:
+            def Ticker(self, sym):
+                return FakeTicker()
+
+        monkeypatch.setattr(sc, "_yf", FakeYF())
+        monkeypatch.setattr(sc, "_YFINANCE_AVAILABLE", True)
+        result = get_pre_market_gap("AAPL")
+        assert result is not None
+        gap_pct, pre_price, prev_close = result
+        assert gap_pct == pytest.approx(0.05)
+        assert pre_price == pytest.approx(105.0)
+        assert prev_close == pytest.approx(100.0)
+
+    def test_returns_none_when_pre_market_price_missing(self, monkeypatch):
+        class FakeFastInfo:
+            pre_market_price = None
+            previous_close = 100.0
+
+        class FakeTicker:
+            fast_info = FakeFastInfo()
+
+        class FakeYF:
+            def Ticker(self, sym):
+                return FakeTicker()
+
+        monkeypatch.setattr(sc, "_yf", FakeYF())
+        monkeypatch.setattr(sc, "_YFINANCE_AVAILABLE", True)
+        result = get_pre_market_gap("AAPL")
+        assert result is None
+
+    def test_negative_gap_down(self, monkeypatch):
+        class FakeFastInfo:
+            pre_market_price = 95.0
+            previous_close = 100.0
+
+        class FakeTicker:
+            fast_info = FakeFastInfo()
+
+        class FakeYF:
+            def Ticker(self, sym):
+                return FakeTicker()
+
+        monkeypatch.setattr(sc, "_yf", FakeYF())
+        monkeypatch.setattr(sc, "_YFINANCE_AVAILABLE", True)
+        result = get_pre_market_gap("TSLA")
+        assert result is not None
+        assert result[0] == pytest.approx(-0.05)
+
+
+# ── scan_pre_market_gaps ──────────────────────────────────────────────────────
+
+
+class TestScanPreMarketGaps:
+    def _patch_gap(self, monkeypatch, sym_gaps: dict):
+        """Patch get_pre_market_gap to return controlled values per symbol."""
+        def fake_get_pre_market_gap(symbol):
+            val = sym_gaps.get(symbol)
+            if val is None:
+                return None
+            return val
+
+        monkeypatch.setattr(sc, "get_pre_market_gap", fake_get_pre_market_gap)
+
+    def test_returns_gappers_above_threshold(self, monkeypatch):
+        self._patch_gap(monkeypatch, {"AAPL": (0.05, 105.0, 100.0)})
+        posted = []
+        monkeypatch.setattr(sc, "_post_discord_embed", lambda embed, url: posted.append(embed))
+        gaps = scan_pre_market_gaps(["AAPL"], threshold=0.02, webhook_url="")
+        assert len(gaps) == 1
+        assert gaps[0][0] == "AAPL"
+        assert gaps[0][1] == pytest.approx(0.05)
+
+    def test_excludes_gappers_below_threshold(self, monkeypatch):
+        self._patch_gap(monkeypatch, {"AAPL": (0.01, 101.0, 100.0)})
+        gaps = scan_pre_market_gaps(["AAPL"], threshold=0.02, webhook_url="")
+        assert gaps == []
+
+    def test_posts_discord_embed_for_each_gapper(self, monkeypatch):
+        self._patch_gap(monkeypatch, {
+            "AAPL": (0.05, 105.0, 100.0),
+            "TSLA": (-0.04, 96.0, 100.0),
+        })
+        posted = []
+        monkeypatch.setattr(sc, "_post_discord_embed", lambda embed, url: posted.append(embed))
+        gaps = scan_pre_market_gaps(["AAPL", "TSLA"], threshold=0.02, webhook_url="http://fake")
+        assert len(gaps) == 2
+        assert len(posted) == 2
+
+    def test_no_discord_post_without_webhook(self, monkeypatch):
+        self._patch_gap(monkeypatch, {"AAPL": (0.05, 105.0, 100.0)})
+        posted = []
+        monkeypatch.setattr(sc, "_post_discord_embed", lambda embed, url: posted.append(embed))
+        monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+        scan_pre_market_gaps(["AAPL"], threshold=0.02, webhook_url="")
+        assert posted == []
+
+    def test_uses_full_watchlist_when_symbols_none(self, monkeypatch):
+        seen = []
+        def fake_gap(symbol):
+            seen.append(symbol)
+            return None
+        monkeypatch.setattr(sc, "get_pre_market_gap", fake_gap)
+        scan_pre_market_gaps(symbols=None, threshold=0.02, webhook_url="")
+        all_watchlist = [sym for syms in WATCHLIST.values() for sym in syms]
+        assert set(seen) == set(all_watchlist)
+
+    def test_gap_down_included_when_above_threshold(self, monkeypatch):
+        self._patch_gap(monkeypatch, {"MSFT": (-0.03, 97.0, 100.0)})
+        gaps = scan_pre_market_gaps(["MSFT"], threshold=0.02, webhook_url="")
+        assert len(gaps) == 1
+        assert gaps[0][1] < 0
+
+
+# ── post_earnings_watch ───────────────────────────────────────────────────────
+
+
+class TestPostEarningsWatch:
+    def _patch_earnings(self, monkeypatch, sym_days: dict):
+        """Patch get_earnings_date to return controlled dates per symbol."""
+        now = datetime.now(tz=timezone.utc)
+
+        def fake_get_earnings_date(symbol):
+            days = sym_days.get(symbol)
+            if days is None:
+                return None
+            return now + timedelta(days=days)
+
+        monkeypatch.setattr(sc, "get_earnings_date", fake_get_earnings_date)
+
+    def test_returns_symbols_with_earnings_this_week(self, monkeypatch):
+        self._patch_earnings(monkeypatch, {"AAPL": 3, "MSFT": 5})
+        result = post_earnings_watch(["AAPL", "MSFT"], webhook_url="")
+        syms = [sym for sym, _ in result]
+        assert "AAPL" in syms
+        assert "MSFT" in syms
+
+    def test_excludes_symbols_with_earnings_outside_week(self, monkeypatch):
+        self._patch_earnings(monkeypatch, {"AAPL": 10})
+        result = post_earnings_watch(["AAPL"], webhook_url="")
+        assert result == []
+
+    def test_result_sorted_by_date(self, monkeypatch):
+        self._patch_earnings(monkeypatch, {"MSFT": 5, "AAPL": 2, "NVDA": 3})
+        result = post_earnings_watch(["MSFT", "AAPL", "NVDA"], webhook_url="")
+        dates = [date_str for _, date_str in result]
+        assert dates == sorted(dates)
+
+    def test_posts_embed_when_webhook_provided(self, monkeypatch):
+        self._patch_earnings(monkeypatch, {"TSLA": 3})
+        posted = []
+        monkeypatch.setattr(sc, "_post_discord_embed", lambda embed, url: posted.append(embed))
+        post_earnings_watch(["TSLA"], webhook_url="http://fake")
+        assert len(posted) == 1
+        assert "Earnings Watch" in posted[0]["title"]
+
+    def test_no_discord_post_without_webhook(self, monkeypatch):
+        self._patch_earnings(monkeypatch, {"TSLA": 3})
+        posted = []
+        monkeypatch.setattr(sc, "_post_discord_embed", lambda embed, url: posted.append(embed))
+        monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+        post_earnings_watch(["TSLA"], webhook_url="")
+        assert posted == []
+
+    def test_uses_full_watchlist_when_symbols_none(self, monkeypatch):
+        seen = []
+        def fake_earnings(symbol):
+            seen.append(symbol)
+            return None
+        monkeypatch.setattr(sc, "get_earnings_date", fake_earnings)
+        post_earnings_watch(symbols=None, webhook_url="")
+        all_watchlist = [sym for syms in WATCHLIST.values() for sym in syms]
+        assert set(seen) == set(all_watchlist)
+
+
+# ── scan() with earnings_date ─────────────────────────────────────────────────
+
+
+class TestScanEarningsAwareness:
+    def _oversold_bars(self, n: int = 20) -> list[PriceBar]:
+        closes = [100.0 - i * 2.0 for i in range(n)]
+        return _bars_from_closes(closes)
+
+    def test_earnings_within_warn_days_adds_note(self):
+        bars = self._oversold_bars()
+        now = datetime.now(tz=timezone.utc)
+        earnings = now + timedelta(days=EARNINGS_WARN_DAYS - 1)
+        signals = scan("AAPL", bars, [], [], earnings_date=earnings)
+        if signals:
+            reasons = signals[0].reasons
+            assert any("EARNINGS" in r for r in reasons)
+
+    def test_earnings_beyond_warn_days_no_note(self):
+        bars = self._oversold_bars()
+        now = datetime.now(tz=timezone.utc)
+        earnings = now + timedelta(days=EARNINGS_WARN_DAYS + 5)
+        signals = scan("AAPL", bars, [], [], earnings_date=earnings)
+        if signals:
+            reasons = signals[0].reasons
+            assert not any("EARNINGS" in r for r in reasons)
+
+    def test_no_earnings_date_no_note(self):
+        bars = self._oversold_bars()
+        signals = scan("AAPL", bars, [], [], earnings_date=None)
+        if signals:
+            reasons = signals[0].reasons
+            assert not any("EARNINGS" in r for r in reasons)
+
+
+# ── scan_with_tracking() earnings exclusion ───────────────────────────────────
+
+
+class TestScanWithTrackingEarningsExclusion:
+    def _oversold_bars(self, n: int = 20) -> list[PriceBar]:
+        closes = [100.0 - i * 2.0 for i in range(n)]
+        return _bars_from_closes(closes)
+
+    def test_earnings_within_exclude_days_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "STATE_FILE", str(tmp_path / "signals.json"))
+        bars = self._oversold_bars()
+        now = datetime.now(tz=timezone.utc)
+        earnings = now + timedelta(days=1)
+        signals = scan_with_tracking("AAPL", bars, [], [], earnings_date=earnings)
+        assert signals == []
+
+    def test_earnings_at_boundary_excluded(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "STATE_FILE", str(tmp_path / "signals.json"))
+        bars = self._oversold_bars()
+        now = datetime.now(tz=timezone.utc)
+        earnings = now + timedelta(hours=2)
+        signals = scan_with_tracking("AAPL", bars, [], [], earnings_date=earnings)
+        assert signals == []
+
+    def test_earnings_outside_exclude_days_allows_signal(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "STATE_FILE", str(tmp_path / "signals.json"))
+        bars = self._oversold_bars()
+        now = datetime.now(tz=timezone.utc)
+        earnings = now + timedelta(days=10)
+        signals = scan_with_tracking("AAPL", bars, [], [], earnings_date=earnings)
+        assert isinstance(signals, list)

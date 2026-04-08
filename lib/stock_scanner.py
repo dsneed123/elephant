@@ -6,7 +6,9 @@ Signal generation pipeline:
   2. Weekly SMA20/SMA50 trend filter — only take signals in the trend direction
   3. 4-hour RSI divergence — bullish/bearish divergence boosts strength
   4. Support/resistance proximity — round numbers and previous swing highs/lows
-  5. Strength adjustments — +15 trend alignment, -20 against-trend penalty
+  5. Volume profile — high-volume price nodes act as support or resistance (+15)
+  6. Unusual options activity — call/put volume >3x open interest (+20 confirm, -10 oppose)
+  7. Strength adjustments — +15 trend alignment, -20 against-trend penalty
 
 Pre-market gap detection and earnings calendar awareness require yfinance.
 Install with: pip install yfinance
@@ -56,6 +58,17 @@ TARGET_2_PCT: float = 0.06        # 6 % second profit target
 STOP_PCT: float = 0.02            # 2 % stop-loss
 SIGNAL_EXPIRY_DAYS: int = 15      # open signals expire after 15 days
 SUMMARY_LOOKBACK_DAYS: int = 30   # performance summary window
+
+# ── volume profile ────────────────────────────────────────────────────────────
+
+VOLUME_PROFILE_LOOKBACK: int = 20  # days of history used to build the profile
+VOLUME_NODE_BONUS: int = 15        # strength added when price is at a volume node
+
+# ── unusual options activity ──────────────────────────────────────────────────
+
+OPTIONS_UNUSUAL_RATIO: float = 3.0  # volume-to-open-interest threshold
+OPTIONS_CONFIRM_BONUS: int = 20     # options confirm signal direction
+OPTIONS_CONTRADICT_PENALTY: int = 10  # options oppose signal direction
 
 # ── pre-market gap detection ──────────────────────────────────────────────────
 
@@ -296,6 +309,121 @@ def _is_near_support_resistance(
     return False
 
 
+# ── volume profile analysis ───────────────────────────────────────────────────
+
+
+def _detect_volume_node(
+    bars: Sequence[PriceBar],
+    current_price: float,
+    lookback: int = VOLUME_PROFILE_LOOKBACK,
+    tolerance: float = SR_TOLERANCE,
+) -> str | None:
+    """
+    Identify the point of control (highest-volume price level) in the last
+    *lookback* bars and check whether *current_price* is near it.
+
+    Uses the typical price ``(high + low + close) / 3`` weighted by volume to
+    build a 20-bin histogram.  The bin with the most accumulated volume is the
+    volume node.
+
+    Returns:
+      "support"    — node is at or below current price (price is sitting on
+                     a high-volume level; acts as a floor)
+      "resistance" — node is above current price (price is approaching a
+                     high-volume ceiling)
+      None         — price is not within *tolerance* of any volume node, or
+                     there is insufficient volume data.
+    """
+    recent = list(bars[-lookback:])
+    if len(recent) < 5:
+        return None
+
+    prices = [(b.high + b.low + b.close) / 3.0 for b in recent]
+    volumes = [b.volume for b in recent]
+
+    if all(v == 0.0 for v in volumes):
+        return None
+
+    price_min = min(prices)
+    price_max = max(prices)
+    if price_max == price_min:
+        return None
+
+    n_bins = 20
+    bin_width = (price_max - price_min) / n_bins
+    bin_volumes = [0.0] * n_bins
+    for p, v in zip(prices, volumes):
+        idx = min(int((p - price_min) / bin_width), n_bins - 1)
+        bin_volumes[idx] += v
+
+    poc_bin = bin_volumes.index(max(bin_volumes))
+    poc_price = price_min + (poc_bin + 0.5) * bin_width
+
+    if abs(current_price - poc_price) / current_price > tolerance:
+        return None
+
+    return "support" if poc_price <= current_price else "resistance"
+
+
+# ── unusual options activity ──────────────────────────────────────────────────
+
+
+def get_unusual_options_activity(symbol: str) -> str | None:
+    """
+    Detect unusual options activity for *symbol* using yfinance.
+
+    Aggregates call and put volume vs open interest across the two nearest
+    expiration dates.  Returns:
+      "calls" — total call volume > OPTIONS_UNUSUAL_RATIO × call open interest
+      "puts"  — total put volume  > OPTIONS_UNUSUAL_RATIO × put open interest
+      None    — no unusual activity, or yfinance is unavailable / data missing
+
+    When both calls and puts qualify, the higher volume-to-OI ratio wins.
+    Silently returns None on any network or data error.
+    """
+    if not _YFINANCE_AVAILABLE:
+        logger.debug("yfinance not available; skipping options activity for %s", symbol)
+        return None
+    try:
+        ticker = _yf.Ticker(symbol)
+        expirations = ticker.options
+        if not expirations:
+            return None
+
+        total_call_vol = 0.0
+        total_call_oi = 0.0
+        total_put_vol = 0.0
+        total_put_oi = 0.0
+
+        for exp in expirations[:2]:
+            chain = ticker.option_chain(exp)
+            calls = chain.calls
+            puts = chain.puts
+            if calls is not None and not calls.empty:
+                total_call_vol += calls["volume"].fillna(0).sum()
+                total_call_oi += calls["openInterest"].fillna(0).sum()
+            if puts is not None and not puts.empty:
+                total_put_vol += puts["volume"].fillna(0).sum()
+                total_put_oi += puts["openInterest"].fillna(0).sum()
+
+        call_ratio = total_call_vol / total_call_oi if total_call_oi > 0 else 0.0
+        put_ratio = total_put_vol / total_put_oi if total_put_oi > 0 else 0.0
+
+        unusual_calls = call_ratio > OPTIONS_UNUSUAL_RATIO
+        unusual_puts = put_ratio > OPTIONS_UNUSUAL_RATIO
+
+        if unusual_calls and unusual_puts:
+            return "calls" if call_ratio >= put_ratio else "puts"
+        if unusual_calls:
+            return "calls"
+        if unusual_puts:
+            return "puts"
+        return None
+    except Exception as exc:  # pragma: no cover
+        logger.debug("Failed to fetch options activity for %s: %s", symbol, exc)
+        return None
+
+
 # ── sector rotation detection ─────────────────────────────────────────────────
 
 
@@ -355,6 +483,7 @@ def scan(
     four_hour_bars: Sequence[PriceBar],
     *,
     earnings_date: datetime | None = None,
+    options_activity: str | None = None,
 ) -> list[SwingSignal]:
     """
     Scan a single symbol for swing trade signals using multi-timeframe confirmation.
@@ -364,7 +493,14 @@ def scan(
       2. Weekly SMA20/SMA50 trend filter applies alignment bonus or against-trend penalty.
       3. 4-hour RSI divergence boosts strength when it confirms the signal.
       4. Support/resistance proximity adds a small strength bonus.
-      5. Earnings awareness — "EARNINGS [date]" note added when earnings fall within
+      5. Volume profile — high-volume price node (POC) adds VOLUME_NODE_BONUS (+15)
+         when price sits near it; reason is "Volume node support" or
+         "Volume node resistance".
+      6. Unusual options activity — *options_activity* should be the result of
+         get_unusual_options_activity(symbol).  "calls" confirms LONG / opposes
+         SHORT; "puts" confirms SHORT / opposes LONG.
+         Confirms: +OPTIONS_CONFIRM_BONUS (+20); opposes: -OPTIONS_CONTRADICT_PENALTY (-10).
+      7. Earnings awareness — "EARNINGS [date]" note added when earnings fall within
          EARNINGS_WARN_DAYS (7 days).  Callers should use *earnings_date* from
          get_earnings_date(); scan_with_tracking() enforces the 2-day exclusion.
 
@@ -433,7 +569,29 @@ def scan(
         base_strength = min(100, base_strength + 5)
         reasons.append("near key support/resistance level")
 
-    # ── 5. Earnings awareness ─────────────────────────────────────────────
+    # ── 5. Volume profile ─────────────────────────────────────────────────
+    volume_node = _detect_volume_node(daily_bars, current_price)
+    if volume_node is not None:
+        base_strength = min(100, base_strength + VOLUME_NODE_BONUS)
+        reasons.append(f"Volume node {volume_node}")
+
+    # ── 6. Unusual options activity ───────────────────────────────────────
+    if options_activity == "calls":
+        if direction == "LONG":
+            base_strength = min(100, base_strength + OPTIONS_CONFIRM_BONUS)
+            reasons.append("Unusual call activity")
+        else:
+            base_strength = max(0, base_strength - OPTIONS_CONTRADICT_PENALTY)
+            reasons.append(f"Unusual call activity (opposes SHORT, -{OPTIONS_CONTRADICT_PENALTY} strength)")
+    elif options_activity == "puts":
+        if direction == "SHORT":
+            base_strength = min(100, base_strength + OPTIONS_CONFIRM_BONUS)
+            reasons.append("Unusual put activity")
+        else:
+            base_strength = max(0, base_strength - OPTIONS_CONTRADICT_PENALTY)
+            reasons.append(f"Unusual put activity (opposes LONG, -{OPTIONS_CONTRADICT_PENALTY} strength)")
+
+    # ── 7. Earnings awareness ─────────────────────────────────────────────
     if earnings_date is not None:
         now = datetime.now(tz=timezone.utc)
         days_to_earnings = (earnings_date - now).days
@@ -932,6 +1090,7 @@ def scan_with_tracking(
     *,
     webhook_url: str | None = None,
     earnings_date: datetime | None = None,
+    options_activity: str | None = None,
 ) -> list[SwingSignal]:
     """
     Scan a symbol for swing signals with persistent state tracking and Discord reporting.
@@ -955,6 +1114,10 @@ def scan_with_tracking(
     The *earnings_date* parameter should be the result of get_earnings_date(symbol).
     When None, earnings filtering is skipped.
 
+    The *options_activity* parameter should be the result of
+    get_unusual_options_activity(symbol).  When None, options signals are
+    skipped (no network call is made inside this function).
+
     Returns the same list[SwingSignal] as scan().
     """
     if webhook_url is None:
@@ -977,7 +1140,14 @@ def scan_with_tracking(
             _save_signal_state(records)
             return []
 
-    signals = scan(symbol, daily_bars, weekly_bars, four_hour_bars, earnings_date=earnings_date)
+    signals = scan(
+        symbol,
+        daily_bars,
+        weekly_bars,
+        four_hour_bars,
+        earnings_date=earnings_date,
+        options_activity=options_activity,
+    )
 
     now = datetime.now(tz=timezone.utc)
     open_keys = {(r["symbol"], r["direction"]) for r in records if r["status"] == "OPEN"}
