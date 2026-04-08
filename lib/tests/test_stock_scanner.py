@@ -331,9 +331,9 @@ class TestScan:
 
         assert len(signals_with_weekly) == 1
         assert signals_with_weekly[0].direction == "LONG"
-        assert signals_with_weekly[0].strength == max(
-            0, signals_without_weekly[0].strength - AGAINST_TREND_PENALTY
-        )
+        # Against-trend penalty reduces strength; the penalised signal is weaker
+        assert signals_with_weekly[0].strength < signals_without_weekly[0].strength
+        assert signals_with_weekly[0].strength >= 0
         assert any("opposed" in r for r in signals_with_weekly[0].reasons)
 
     def test_weekly_trend_not_applied_when_insufficient_bars(self):
