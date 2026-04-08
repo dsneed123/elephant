@@ -11,10 +11,16 @@ Signal generation pipeline:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Sequence
+from urllib.request import Request, urlopen
+import urllib.error
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +38,18 @@ RSI_PERIOD: int = 14
 # ── support/resistance tolerance (fraction of price) ─────────────────────────
 
 SR_TOLERANCE: float = 0.005  # 0.5 %
+
+# ── signal tracking ───────────────────────────────────────────────────────────
+
+TARGET_1_PCT: float = 0.03        # 3 % first profit target
+TARGET_2_PCT: float = 0.06        # 6 % second profit target
+STOP_PCT: float = 0.02            # 2 % stop-loss
+SIGNAL_EXPIRY_DAYS: int = 15      # open signals expire after 15 days
+SUMMARY_LOOKBACK_DAYS: int = 30   # performance summary window
+
+# state/swing_signals.json sits at the repo root (parent of lib/)
+_REPO_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATE_FILE: str = os.path.join(_REPO_ROOT, "state", "swing_signals.json")
 
 
 # ── data structures ───────────────────────────────────────────────────────────
@@ -293,3 +311,261 @@ def scan(
     )
 
     return [SwingSignal(symbol=symbol, direction=direction, strength=base_strength, reasons=reasons)]
+
+
+# ── signal state management ───────────────────────────────────────────────────
+
+
+def _load_signal_state() -> list[dict]:
+    """Load persisted signal records from STATE_FILE. Returns [] on missing/corrupt file."""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_signal_state(records: list[dict]) -> None:
+    """Write signal records to STATE_FILE, creating the directory if needed."""
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+
+
+def _resolve_open_signals(
+    records: list[dict],
+    symbol: str,
+    daily_bars: Sequence[PriceBar],
+) -> list[dict]:
+    """
+    Update the status of OPEN signals for *symbol* against recent daily bars.
+
+    Resolution rules (checked in priority order per bar):
+      WIN     — target_1 reached: high >= target_1 (LONG) or low <= target_1 (SHORT)
+      LOSS    — stop reached: low <= stop (LONG) or high >= stop (SHORT)
+      EXPIRED — signal age exceeds SIGNAL_EXPIRY_DAYS with no resolution
+
+    When WIN and LOSS conditions are both met on the same bar, WIN takes priority.
+    Non-open records and records for other symbols are returned unchanged.
+    """
+    now = datetime.now(tz=timezone.utc)
+    updated: list[dict] = []
+
+    for rec in records:
+        if rec["symbol"] != symbol or rec["status"] != "OPEN":
+            updated.append(rec)
+            continue
+
+        sig_time = datetime.fromisoformat(rec["timestamp"])
+        age_days = (now - sig_time).days
+
+        if age_days > SIGNAL_EXPIRY_DAYS:
+            updated.append({**rec, "status": "EXPIRED", "closed_at": now.isoformat()})
+            continue
+
+        # Approximate the bars that occurred since the signal was generated.
+        # daily_bars are assumed chronological (oldest first, newest last).
+        lookback = min(age_days + 1, len(daily_bars))
+        recent_bars = list(daily_bars[-lookback:]) if lookback > 0 else []
+
+        direction = rec["direction"]
+        target_1: float = rec["target_1"]
+        stop: float = rec["stop"]
+        entry: float = rec["entry_price"]
+
+        resolved_rec = rec
+        for bar in recent_bars:
+            if direction == "LONG":
+                if bar.high >= target_1:
+                    pnl = (target_1 - entry) / entry
+                    resolved_rec = {**rec, "status": "WIN", "closed_at": now.isoformat(), "pnl_pct": pnl}
+                    break
+                if bar.low <= stop:
+                    pnl = (stop - entry) / entry
+                    resolved_rec = {**rec, "status": "LOSS", "closed_at": now.isoformat(), "pnl_pct": pnl}
+                    break
+            else:  # SHORT
+                if bar.low <= target_1:
+                    pnl = (entry - target_1) / entry
+                    resolved_rec = {**rec, "status": "WIN", "closed_at": now.isoformat(), "pnl_pct": pnl}
+                    break
+                if bar.high >= stop:
+                    pnl = (entry - stop) / entry
+                    resolved_rec = {**rec, "status": "LOSS", "closed_at": now.isoformat(), "pnl_pct": pnl}
+                    break
+
+        updated.append(resolved_rec)
+
+    return updated
+
+
+def _performance_stats(records: list[dict]) -> dict:
+    """
+    Compute win/loss statistics from signals in the last SUMMARY_LOOKBACK_DAYS days.
+
+    Returns a dict with keys:
+      total, wins, losses, expired, open, win_rate, avg_win_pct, avg_loss_pct
+    """
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=SUMMARY_LOOKBACK_DAYS)
+    recent = [r for r in records if datetime.fromisoformat(r["timestamp"]) >= cutoff]
+
+    wins = [r for r in recent if r["status"] == "WIN"]
+    losses = [r for r in recent if r["status"] == "LOSS"]
+    expired = [r for r in recent if r["status"] == "EXPIRED"]
+    open_sigs = [r for r in recent if r["status"] == "OPEN"]
+
+    decided = len(wins) + len(losses)
+    win_rate = len(wins) / decided if decided > 0 else 0.0
+    avg_win_pct = sum(r["pnl_pct"] for r in wins) / len(wins) if wins else 0.0
+    avg_loss_pct = sum(r["pnl_pct"] for r in losses) / len(losses) if losses else 0.0
+
+    return {
+        "total": len(recent),
+        "wins": len(wins),
+        "losses": len(losses),
+        "expired": len(expired),
+        "open": len(open_sigs),
+        "win_rate": win_rate,
+        "avg_win_pct": avg_win_pct,
+        "avg_loss_pct": avg_loss_pct,
+    }
+
+
+def _signal_embed(record: dict) -> dict:
+    """Build a Discord embed dict for a newly detected swing signal."""
+    direction = record["direction"]
+    color = 0x57F287 if direction == "LONG" else 0xED4245
+    entry: float = record["entry_price"]
+    return {
+        "title": f"{direction} Signal — {record['symbol']}",
+        "color": color,
+        "fields": [
+            {"name": "Symbol", "value": record["symbol"], "inline": True},
+            {"name": "Direction", "value": direction, "inline": True},
+            {"name": "Strength", "value": str(record["strength"]), "inline": True},
+            {"name": "Entry", "value": f"${entry:.2f}", "inline": True},
+            {"name": "Target 1", "value": f"${record['target_1']:.2f}", "inline": True},
+            {"name": "Stop", "value": f"${record['stop']:.2f}", "inline": True},
+            {"name": "Reasons", "value": "; ".join(record.get("reasons", [])) or "—", "inline": False},
+        ],
+    }
+
+
+def _performance_embed(stats: dict) -> dict:
+    """Build a Discord embed dict for the performance summary."""
+    decided = stats["wins"] + stats["losses"]
+    win_rate_str = f"{stats['win_rate']:.1%}" if decided > 0 else "N/A"
+    avg_win_str = f"+{stats['avg_win_pct']:.2%}" if stats["wins"] > 0 else "N/A"
+    avg_loss_str = f"{stats['avg_loss_pct']:.2%}" if stats["losses"] > 0 else "N/A"
+    return {
+        "title": "Performance Summary",
+        "description": f"Swing signal accuracy over the last {SUMMARY_LOOKBACK_DAYS} days",
+        "color": 0x5865F2,
+        "fields": [
+            {"name": "Total Signals", "value": str(stats["total"]), "inline": True},
+            {"name": "Wins", "value": str(stats["wins"]), "inline": True},
+            {"name": "Losses", "value": str(stats["losses"]), "inline": True},
+            {"name": "Expired", "value": str(stats["expired"]), "inline": True},
+            {"name": "Win Rate", "value": win_rate_str, "inline": True},
+            {"name": "Avg Win", "value": avg_win_str, "inline": True},
+            {"name": "Avg Loss", "value": avg_loss_str, "inline": True},
+        ],
+    }
+
+
+def _post_discord_embed(embed: dict, webhook_url: str) -> None:
+    """POST a single Discord embed to *webhook_url*. Silently logs on failure."""
+    if not webhook_url:
+        return
+    payload = json.dumps({"embeds": [embed]}).encode("utf-8")
+    req = Request(
+        webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=5) as resp:
+            if resp.status >= 400:
+                logger.warning("Discord webhook returned HTTP %d", resp.status)
+    except urllib.error.URLError as exc:
+        logger.warning("Discord webhook POST failed: %s", exc)
+
+
+def scan_with_tracking(
+    symbol: str,
+    daily_bars: Sequence[PriceBar],
+    weekly_bars: Sequence[PriceBar],
+    four_hour_bars: Sequence[PriceBar],
+    *,
+    webhook_url: str | None = None,
+) -> list[SwingSignal]:
+    """
+    Scan a symbol for swing signals with persistent state tracking and Discord reporting.
+
+    On each call:
+      1. Load existing signal records from state/swing_signals.json.
+      2. Resolve any OPEN signals for *symbol* (WIN / LOSS / EXPIRED) using daily_bars.
+      3. Run the standard multi-timeframe scan() to detect new signals.
+      4. Record each new signal (entry, target_1, target_2, stop) in state.
+      5. Persist the updated records.
+      6. If new signals were found and a webhook URL is available, post a signal embed
+         followed by a Performance Summary embed to Discord.
+
+    The webhook URL is taken from the *webhook_url* parameter or the
+    DISCORD_WEBHOOK_URL environment variable (parameter takes priority).
+
+    Returns the same list[SwingSignal] as scan().
+    """
+    if webhook_url is None:
+        webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+    records = _load_signal_state()
+    records = _resolve_open_signals(records, symbol, daily_bars)
+
+    signals = scan(symbol, daily_bars, weekly_bars, four_hour_bars)
+
+    now = datetime.now(tz=timezone.utc)
+    open_keys = {(r["symbol"], r["direction"]) for r in records if r["status"] == "OPEN"}
+    new_records: list[dict] = []
+
+    for sig in signals:
+        if (sig.symbol, sig.direction) in open_keys:
+            continue  # already tracking an open signal for this symbol+direction
+        entry = daily_bars[-1].close if daily_bars else 0.0
+        if sig.direction == "LONG":
+            target_1 = entry * (1.0 + TARGET_1_PCT)
+            target_2 = entry * (1.0 + TARGET_2_PCT)
+            stop = entry * (1.0 - STOP_PCT)
+        else:
+            target_1 = entry * (1.0 - TARGET_1_PCT)
+            target_2 = entry * (1.0 - TARGET_2_PCT)
+            stop = entry * (1.0 + STOP_PCT)
+
+        rec: dict = {
+            "id": str(uuid.uuid4()),
+            "symbol": sig.symbol,
+            "direction": sig.direction,
+            "strength": sig.strength,
+            "reasons": sig.reasons,
+            "timestamp": now.isoformat(),
+            "entry_price": entry,
+            "target_1": target_1,
+            "target_2": target_2,
+            "stop": stop,
+            "status": "OPEN",
+            "closed_at": None,
+            "pnl_pct": None,
+        }
+        records.append(rec)
+        new_records.append(rec)
+
+    _save_signal_state(records)
+
+    if new_records and webhook_url:
+        for rec in new_records:
+            _post_discord_embed(_signal_embed(rec), webhook_url)
+        stats = _performance_stats(records)
+        _post_discord_embed(_performance_embed(stats), webhook_url)
+
+    return signals
