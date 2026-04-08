@@ -1,17 +1,24 @@
 """Tests for lib/stock_scanner.py — multi-timeframe swing signal scanner."""
 
+import json
 import math
 import sys
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 # Allow running tests from the repo root or lib/ directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import stock_scanner as sc
 from stock_scanner import (
     AGAINST_TREND_PENALTY,
     RSI_PERIOD,
+    SIGNAL_EXPIRY_DAYS,
+    SUMMARY_LOOKBACK_DAYS,
+    TARGET_1_PCT,
+    STOP_PCT,
     TREND_ALIGNMENT_BONUS,
     PriceBar,
     SwingSignal,
@@ -20,7 +27,14 @@ from stock_scanner import (
     _detect_rsi_divergence,
     _detect_weekly_trend,
     _is_near_support_resistance,
+    _load_signal_state,
+    _performance_embed,
+    _performance_stats,
+    _resolve_open_signals,
+    _save_signal_state,
+    _signal_embed,
     scan,
+    scan_with_tracking,
 )
 
 
@@ -403,3 +417,314 @@ class TestScan:
         signals = scan("X", bars, weekly, [])
         if signals:
             assert signals[0].strength >= 0
+
+
+# ── signal state helpers ──────────────────────────────────────────────────────
+
+
+def _make_open_record(
+    symbol: str = "AAPL",
+    direction: str = "LONG",
+    entry: float = 100.0,
+    days_ago: int = 0,
+) -> dict:
+    ts = (datetime.now(tz=timezone.utc) - timedelta(days=days_ago)).isoformat()
+    if direction == "LONG":
+        target_1 = entry * (1.0 + TARGET_1_PCT)
+        stop = entry * (1.0 - STOP_PCT)
+    else:
+        target_1 = entry * (1.0 - TARGET_1_PCT)
+        stop = entry * (1.0 + STOP_PCT)
+    return {
+        "id": "test-id",
+        "symbol": symbol,
+        "direction": direction,
+        "strength": 70,
+        "reasons": [],
+        "timestamp": ts,
+        "entry_price": entry,
+        "target_1": target_1,
+        "target_2": entry * 1.06 if direction == "LONG" else entry * 0.94,
+        "stop": stop,
+        "status": "OPEN",
+        "closed_at": None,
+        "pnl_pct": None,
+    }
+
+
+# ── _load_signal_state / _save_signal_state ───────────────────────────────────
+
+
+class TestLoadSaveState:
+    def test_load_returns_empty_when_file_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "STATE_FILE", str(tmp_path / "swing_signals.json"))
+        assert _load_signal_state() == []
+
+    def test_load_returns_empty_on_corrupt_json(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "swing_signals.json"
+        state_file.write_text("not json")
+        monkeypatch.setattr(sc, "STATE_FILE", str(state_file))
+        assert _load_signal_state() == []
+
+    def test_save_creates_directory_and_file(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "state" / "swing_signals.json"
+        monkeypatch.setattr(sc, "STATE_FILE", str(state_file))
+        records = [{"id": "1", "symbol": "AAPL"}]
+        _save_signal_state(records)
+        assert state_file.exists()
+        assert json.loads(state_file.read_text()) == records
+
+    def test_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "STATE_FILE", str(tmp_path / "swing_signals.json"))
+        records = [_make_open_record()]
+        _save_signal_state(records)
+        loaded = _load_signal_state()
+        assert len(loaded) == 1
+        assert loaded[0]["symbol"] == "AAPL"
+
+
+# ── _resolve_open_signals ─────────────────────────────────────────────────────
+
+
+class TestResolveOpenSignals:
+    def _long_bars_hitting_target(self, entry: float) -> list[PriceBar]:
+        """Return a bar whose high exceeds the LONG target_1."""
+        target_1 = entry * (1.0 + TARGET_1_PCT)
+        return [PriceBar(open=entry, high=target_1 + 1.0, low=entry * 0.99, close=entry)]
+
+    def _long_bars_hitting_stop(self, entry: float) -> list[PriceBar]:
+        """Return a bar whose low is below the LONG stop."""
+        stop = entry * (1.0 - STOP_PCT)
+        return [PriceBar(open=entry, high=entry * 1.01, low=stop - 1.0, close=entry)]
+
+    def test_long_win_when_target_hit(self):
+        rec = _make_open_record(direction="LONG", entry=100.0)
+        bars = self._long_bars_hitting_target(100.0)
+        result = _resolve_open_signals([rec], "AAPL", bars)
+        assert result[0]["status"] == "WIN"
+        assert result[0]["pnl_pct"] == pytest.approx(TARGET_1_PCT)
+
+    def test_long_loss_when_stop_hit(self):
+        rec = _make_open_record(direction="LONG", entry=100.0)
+        bars = self._long_bars_hitting_stop(100.0)
+        result = _resolve_open_signals([rec], "AAPL", bars)
+        assert result[0]["status"] == "LOSS"
+        assert result[0]["pnl_pct"] == pytest.approx(-STOP_PCT)
+
+    def test_short_win_when_target_hit(self):
+        rec = _make_open_record(direction="SHORT", entry=100.0)
+        target_1 = 100.0 * (1.0 - TARGET_1_PCT)
+        bars = [PriceBar(open=100.0, high=100.5, low=target_1 - 0.5, close=100.0)]
+        result = _resolve_open_signals([rec], "AAPL", bars)
+        assert result[0]["status"] == "WIN"
+        assert result[0]["pnl_pct"] == pytest.approx(TARGET_1_PCT)
+
+    def test_short_loss_when_stop_hit(self):
+        rec = _make_open_record(direction="SHORT", entry=100.0)
+        stop = 100.0 * (1.0 + STOP_PCT)
+        bars = [PriceBar(open=100.0, high=stop + 0.5, low=99.5, close=100.0)]
+        result = _resolve_open_signals([rec], "AAPL", bars)
+        assert result[0]["status"] == "LOSS"
+        assert result[0]["pnl_pct"] == pytest.approx(-STOP_PCT)
+
+    def test_win_takes_priority_over_loss_on_same_bar(self):
+        rec = _make_open_record(direction="LONG", entry=100.0)
+        target_1 = 100.0 * (1.0 + TARGET_1_PCT)
+        stop = 100.0 * (1.0 - STOP_PCT)
+        # Bar where both high >= target_1 and low <= stop (extreme bar)
+        bars = [PriceBar(open=100.0, high=target_1 + 1.0, low=stop - 1.0, close=100.0)]
+        result = _resolve_open_signals([rec], "AAPL", bars)
+        assert result[0]["status"] == "WIN"
+
+    def test_expired_when_older_than_expiry_days(self):
+        rec = _make_open_record(days_ago=SIGNAL_EXPIRY_DAYS + 1)
+        result = _resolve_open_signals([rec], "AAPL", [])
+        assert result[0]["status"] == "EXPIRED"
+        assert result[0]["closed_at"] is not None
+
+    def test_other_symbol_not_modified(self):
+        rec_aapl = _make_open_record(symbol="AAPL")
+        rec_tsla = _make_open_record(symbol="TSLA")
+        result = _resolve_open_signals([rec_aapl, rec_tsla], "AAPL", [])
+        tsla_result = next(r for r in result if r["symbol"] == "TSLA")
+        assert tsla_result["status"] == "OPEN"
+
+    def test_already_closed_records_not_modified(self):
+        rec = _make_open_record()
+        rec["status"] = "WIN"
+        rec["pnl_pct"] = 0.03
+        result = _resolve_open_signals([rec], "AAPL", [])
+        assert result[0]["status"] == "WIN"
+        assert result[0]["pnl_pct"] == 0.03
+
+    def test_no_resolution_when_bars_dont_reach_levels(self):
+        rec = _make_open_record(entry=100.0)
+        # Bar that moves sideways, doesn't reach target or stop
+        bars = [PriceBar(open=100.0, high=101.0, low=99.5, close=100.0)]
+        result = _resolve_open_signals([rec], "AAPL", bars)
+        assert result[0]["status"] == "OPEN"
+
+
+# ── _performance_stats ────────────────────────────────────────────────────────
+
+
+class TestPerformanceStats:
+    def _closed(self, status: str, pnl: float, days_ago: int = 1) -> dict:
+        rec = _make_open_record(days_ago=days_ago)
+        rec["status"] = status
+        rec["pnl_pct"] = pnl
+        rec["closed_at"] = (datetime.now(tz=timezone.utc) - timedelta(days=days_ago)).isoformat()
+        return rec
+
+    def test_empty_records_returns_zeros(self):
+        stats = _performance_stats([])
+        assert stats["total"] == 0
+        assert stats["wins"] == 0
+        assert stats["win_rate"] == 0.0
+
+    def test_win_rate_calculation(self):
+        records = [
+            self._closed("WIN", 0.03),
+            self._closed("WIN", 0.03),
+            self._closed("LOSS", -0.02),
+        ]
+        stats = _performance_stats(records)
+        assert stats["wins"] == 2
+        assert stats["losses"] == 1
+        assert stats["win_rate"] == pytest.approx(2 / 3)
+
+    def test_avg_win_pct(self):
+        records = [self._closed("WIN", 0.04), self._closed("WIN", 0.02)]
+        stats = _performance_stats(records)
+        assert stats["avg_win_pct"] == pytest.approx(0.03)
+
+    def test_avg_loss_pct(self):
+        records = [self._closed("LOSS", -0.02), self._closed("LOSS", -0.04)]
+        stats = _performance_stats(records)
+        assert stats["avg_loss_pct"] == pytest.approx(-0.03)
+
+    def test_old_signals_excluded(self):
+        old = self._closed("WIN", 0.03, days_ago=SUMMARY_LOOKBACK_DAYS + 1)
+        recent = self._closed("WIN", 0.03, days_ago=1)
+        stats = _performance_stats([old, recent])
+        assert stats["total"] == 1
+        assert stats["wins"] == 1
+
+    def test_expired_counted_separately(self):
+        records = [self._closed("EXPIRED", 0.0), self._closed("WIN", 0.03)]
+        stats = _performance_stats(records)
+        assert stats["expired"] == 1
+        assert stats["wins"] == 1
+        assert stats["total"] == 2
+
+
+# ── _performance_embed ────────────────────────────────────────────────────────
+
+
+class TestPerformanceEmbed:
+    def _stats(self, **kwargs) -> dict:
+        base = {
+            "total": 10, "wins": 7, "losses": 2, "expired": 1, "open": 0,
+            "win_rate": 0.777, "avg_win_pct": 0.03, "avg_loss_pct": -0.02,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_embed_has_title(self):
+        embed = _performance_embed(self._stats())
+        assert embed["title"] == "Performance Summary"
+
+    def test_win_rate_shown_as_percentage(self):
+        embed = _performance_embed(self._stats(wins=3, losses=1, win_rate=0.75))
+        win_rate_field = next(f for f in embed["fields"] if f["name"] == "Win Rate")
+        assert "75.0%" in win_rate_field["value"]
+
+    def test_na_shown_when_no_decided_signals(self):
+        embed = _performance_embed(self._stats(wins=0, losses=0, win_rate=0.0))
+        win_rate_field = next(f for f in embed["fields"] if f["name"] == "Win Rate")
+        assert win_rate_field["value"] == "N/A"
+
+    def test_avg_win_shown_with_plus_sign(self):
+        embed = _performance_embed(self._stats())
+        avg_win_field = next(f for f in embed["fields"] if f["name"] == "Avg Win")
+        assert avg_win_field["value"].startswith("+")
+
+    def test_avg_loss_shown_as_negative(self):
+        embed = _performance_embed(self._stats())
+        avg_loss_field = next(f for f in embed["fields"] if f["name"] == "Avg Loss")
+        assert "-" in avg_loss_field["value"]
+
+
+# ── scan_with_tracking ────────────────────────────────────────────────────────
+
+
+class TestScanWithTracking:
+    def test_returns_same_signals_as_scan(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "STATE_FILE", str(tmp_path / "swing_signals.json"))
+        closes = [100.0 - i * 2 for i in range(20)]
+        bars = _bars_from_closes(closes)
+        signals_plain = scan("AAPL", bars, [], [])
+        signals_tracked = scan_with_tracking("AAPL", bars, [], [])
+        assert len(signals_tracked) == len(signals_plain)
+        if signals_tracked:
+            assert signals_tracked[0].direction == signals_plain[0].direction
+
+    def test_new_signal_persisted_to_state(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "swing_signals.json"
+        monkeypatch.setattr(sc, "STATE_FILE", str(state_file))
+        closes = [100.0 - i * 2 for i in range(20)]
+        bars = _bars_from_closes(closes)
+        signals = scan_with_tracking("AAPL", bars, [], [])
+        if signals:
+            records = json.loads(state_file.read_text())
+            assert any(r["symbol"] == "AAPL" for r in records)
+            assert any(r["status"] == "OPEN" for r in records)
+
+    def test_signal_record_has_required_fields(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "swing_signals.json"
+        monkeypatch.setattr(sc, "STATE_FILE", str(state_file))
+        closes = [100.0 - i * 2 for i in range(20)]
+        bars = _bars_from_closes(closes)
+        signals = scan_with_tracking("AAPL", bars, [], [])
+        if signals:
+            records = json.loads(state_file.read_text())
+            rec = records[0]
+            for key in ("id", "symbol", "direction", "timestamp", "entry_price",
+                        "target_1", "target_2", "stop", "status"):
+                assert key in rec
+
+    def test_duplicate_open_signal_not_added(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "swing_signals.json"
+        monkeypatch.setattr(sc, "STATE_FILE", str(state_file))
+        closes = [100.0 - i * 2 for i in range(20)]
+        bars = _bars_from_closes(closes)
+        # Call twice — second call should not duplicate the open signal
+        scan_with_tracking("AAPL", bars, [], [])
+        scan_with_tracking("AAPL", bars, [], [])
+        records = json.loads(state_file.read_text())
+        open_aapl = [r for r in records if r["symbol"] == "AAPL" and r["status"] == "OPEN"]
+        assert len(open_aapl) <= 1
+
+    def test_no_discord_post_without_webhook(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "STATE_FILE", str(tmp_path / "swing_signals.json"))
+        monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+        posted = []
+        monkeypatch.setattr(sc, "_post_discord_embed", lambda embed, url: posted.append(embed))
+        closes = [100.0 - i * 2 for i in range(20)]
+        bars = _bars_from_closes(closes)
+        scan_with_tracking("AAPL", bars, [], [])
+        assert posted == []
+
+    def test_discord_post_when_webhook_provided(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "STATE_FILE", str(tmp_path / "swing_signals.json"))
+        posted = []
+        monkeypatch.setattr(sc, "_post_discord_embed", lambda embed, url: posted.append(embed))
+        closes = [100.0 - i * 2 for i in range(20)]
+        bars = _bars_from_closes(closes)
+        signals = scan_with_tracking("AAPL", bars, [], [], webhook_url="http://fake-webhook")
+        if signals:
+            # Expect: one signal embed + one performance summary embed
+            assert len(posted) == 2
+            titles = [p["title"] for p in posted]
+            assert any("Signal" in t for t in titles)
+            assert any("Performance" in t for t in titles)
